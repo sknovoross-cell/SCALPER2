@@ -161,26 +161,30 @@ export function useEngine() {
   timeframeRef.current = timeframe;
   const klinesCacheRef = useRef<{ [key: string]: ChartCandle[] }>({});
 
-  // 1. Fetch initial background data mapping from robust fallback routes across multiple timeframes (M1, M5, M15, H1, H4, D1)
-  useEffect(() => {
-    const symbol = "BTCUSDT";
-
-    async function fetchInterval(interval: string, limit: number): Promise<any[][] | null> {
-      try {
-        const res = await fetch(`/api/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (Array.isArray(data) && data.length > 0) {
-            return data;
-          }
+  // Helper to fetch kline lists from backend API safely
+  const fetchInterval = async (interval: string, limit: number): Promise<any[][] | null> => {
+    try {
+      const symbol = "BTCUSDT";
+      const res = await fetch(`/api/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data) && data.length > 0) {
+          return data;
         }
-      } catch (e) {
-        // ignore fallback errors
       }
-      return null;
+    } catch (e) {
+      // ignore fallback errors
     }
+    return null;
+  };
 
-    async function loadData() {
+  const isRecalculatingRef = useRef(false);
+
+  // Core level collector & chart data loader
+  const loadData = async (isPeriodic = false) => {
+    if (isRecalculatingRef.current) return;
+    isRecalculatingRef.current = true;
+    try {
       // Parallel CORS-bypassed micro-pivoting fetches
       const [k1m, k5m, k15m, k1h, k4h, k1d] = await Promise.all([
         fetchInterval("1m", 100),
@@ -210,6 +214,11 @@ export function useEngine() {
               close: parseFloat(d[4]),
             };
           });
+        }
+
+        // If periodic, avoid wiping cache if backend fails
+        if (isPeriodic && klinesCacheRef.current[intervalName]?.length > 0) {
+          return klinesCacheRef.current[intervalName];
         }
 
         const nowMs = Date.now();
@@ -249,7 +258,7 @@ export function useEngine() {
         return simulated;
       }
 
-      const basePrice = 64250.0;
+      const basePrice = aggRef.current.lastPrice || 64250.0;
       const parsed1m = parseOrSimulate(k1m, "1m", 100, basePrice);
       const finalPrice = parsed1m.length > 0 ? parsed1m[parsed1m.length - 1].close : basePrice;
 
@@ -270,7 +279,7 @@ export function useEngine() {
 
       setChartData(klinesCacheRef.current[timeframeRef.current] || parsed1m);
 
-      if (parsed1m.length > 0) {
+      if (parsed1m.length > 0 && aggRef.current.lastPrice === 0) {
         aggRef.current.lastPrice = finalPrice;
       }
 
@@ -288,7 +297,7 @@ export function useEngine() {
 
       // A helper to extract pivot highs / lows (local 3-bar extremes)
       function extractPivots(
-        candles: any[][] | null, 
+        candles: any[][] | { open: number; high: number; low: number; close: number; time: string }[] | null, 
         tfLabel: string, 
         baseColorHigh: string, 
         baseColorLow: string, 
@@ -302,11 +311,32 @@ export function useEngine() {
           const prev3 = candles.slice(i - 3, i);
           const next3 = candles.slice(i + 1, i + 4);
           const curr = candles[i];
-          const currHigh = parseFloat(curr[2]);
-          const currLow = parseFloat(curr[3]);
+          
+          let currHigh = 0;
+          let currLow = 0;
+          if (Array.isArray(curr)) {
+            currHigh = parseFloat(curr[2]);
+            currLow = parseFloat(curr[3]);
+          } else {
+            currHigh = curr.high;
+            currLow = curr.low;
+          }
 
-          const isPivotHigh = prev3.every(p => currHigh >= parseFloat(p[2])) && next3.every(n => currHigh > parseFloat(n[2]));
-          const isPivotLow = prev3.every(p => currLow <= parseFloat(p[3])) && next3.every(n => currLow < parseFloat(n[3]));
+          const isPivotHigh = prev3.every(p => {
+            const h = Array.isArray(p) ? parseFloat(p[2]) : p.high;
+            return currHigh >= h;
+          }) && next3.every(n => {
+            const h = Array.isArray(n) ? parseFloat(n[2]) : n.high;
+            return currHigh > h;
+          });
+
+          const isPivotLow = prev3.every(p => {
+            const l = Array.isArray(p) ? parseFloat(p[3]) : p.low;
+            return currLow <= l;
+          }) && next3.every(n => {
+            const l = Array.isArray(n) ? parseFloat(n[3]) : n.low;
+            return currLow < l;
+          });
 
           if (isPivotHigh) {
             candidates.push({ 
@@ -335,9 +365,9 @@ export function useEngine() {
       if (k1d && k1d.length > 0) {
         let dailyMax = 0;
         let dailyMin = Infinity;
-        k1d.forEach(c => {
-          const h = parseFloat(c[2]);
-          const l = parseFloat(c[3]);
+        (k1d as any[]).forEach((c: any) => {
+          const h = Array.isArray(c) ? parseFloat(c[2]) : c.high;
+          const l = Array.isArray(c) ? parseFloat(c[3]) : c.low;
           if (h > dailyMax) dailyMax = h;
           if (l < dailyMin) dailyMin = l;
         });
@@ -346,10 +376,10 @@ export function useEngine() {
       }
 
       // Extract levels from alternative senior and junior timeframes
-      extractPivots(k4h, "H4", "#f59e0b", "#10b981", 4, "4h"); // orange / emerald
-      extractPivots(k1h, "H1", "#d946ef", "#06b6d4", 3, "1h"); // fuchsia / cyan
-      extractPivots(k15m, "M15", "#84cc16", "#a855f7", 2, "15m"); // lime / purple
-      extractPivots(k5m, "M5", "#fb7185", "#38bdf8", 1, "5m"); // rose / sky
+      extractPivots(parsed4h, "H4", "#f59e0b", "#10b981", 4, "4h"); // orange / emerald
+      extractPivots(parsed1h, "H1", "#d946ef", "#06b6d4", 3, "1h"); // fuchsia / cyan
+      extractPivots(parsed15m, "M15", "#84cc16", "#a855f7", 2, "15m"); // lime / purple
+      extractPivots(parsed5m, "M5", "#fb7185", "#38bdf8", 1, "5m"); // rose / sky
 
       // Sort candidated pivot zones by timeframe scale weight (seniority)
       candidates.sort((a, b) => b.scale - a.scale);
@@ -365,21 +395,74 @@ export function useEngine() {
 
         const tooClose = distinctZones.some(z => Math.abs(z.price - cand.price) < clusterThreshold);
         if (!tooClose) {
+          const updateTimeStr = new Date().toLocaleTimeString('ru-RU');
+          const isResistance = cand.price >= finalPrice;
+          const tfUpper = (cand.timeframe || '1m').toUpperCase();
+          let finalType = cand.type;
+          let finalColor = cand.color;
+          const criteria: string[] = [];
+
+          if (cand.timeframe === '1d') {
+            finalType = isResistance ? "1D SWING RESIST" : "1D SWING SUPPORT";
+            finalColor = isResistance ? "#f43f5e" : "#3b82f6";
+            criteria.push("Крайние точки диапазона (Swing): Абсолютный экстремум за 30 дней.");
+            criteria.push(isResistance ? "Пул ликвидности (HTF): Высокая плотность лимитных ордеров на продажу." : "Пул ликвидности (HTF): Высокая плотность лимитных ордеров на покупку.");
+            criteria.push("Объемный профиль: Крупный исторический горизонтальный узел.");
+          } else {
+            finalType = isResistance ? `${tfUpper} RESIST` : `${tfUpper} SUPPORT`;
+            if (cand.timeframe === '4h') {
+              finalColor = isResistance ? "#f59e0b" : "#10b981";
+            } else if (cand.timeframe === '1h') {
+              finalColor = isResistance ? "#d946ef" : "#06b6d4";
+            } else if (cand.timeframe === '15m') {
+              finalColor = isResistance ? "#84cc16" : "#a855f7";
+            } else { // 5m
+              finalColor = isResistance ? "#fb7185" : "#38bdf8";
+            }
+
+            if (cand.levelStrength === 'HTF') {
+              criteria.push(`Сильный разворот ${tfUpper}: Подтвержденная 3-барная структура.`);
+              criteria.push(isResistance ? "Защита уровня (Resist): Лимитные заявки продавцов (Ask blocks)." : "Защита уровня (Support): Лимитные заявки покупателей (Bid blocks).");
+              criteria.push("Подтверждение CVD: Обнаружены следы агрессивного поглощения.");
+            } else {
+              criteria.push(`Микро-свинг ${tfUpper}: Быстрый локальный экстремум.`);
+              criteria.push(isResistance ? "Зона предложения рынка: Возможный ложный пробой." : "Зона спроса рынка: Ожидаемая реакция покупателя.");
+              criteria.push("Краткосрочный импульс: Подходит для скальпинг-пробоев.");
+            }
+          }
+
           distinctZones.push({
             price: cand.price,
-            type: cand.type,
-            color: cand.color,
+            type: finalType,
+            color: finalColor,
             levelStrength: cand.levelStrength,
-            timeframe: cand.timeframe
+            timeframe: cand.timeframe,
+            updatedAt: updateTimeStr,
+            validationCriteria: criteria
           });
         }
       });
 
       // Filter to top 30 most senior levels globally to allow beautiful down-sampling in components
       setZones(distinctZones.slice(0, 30));
+    } catch (e) {
+      console.error("Error recalculating zones:", e);
+    } finally {
+      isRecalculatingRef.current = false;
     }
+  };
 
+  // 1. Fetch initial background data mapping from robust fallback routes across multiple timeframes (M1, M5, M15, H1, H4, D1)
+  useEffect(() => {
     loadData();
+  }, []);
+
+  // 1b. Periodic background levels re-evaluation & candle-pivot drift alignment (Every 60 seconds)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      loadData(true);
+    }, 60000);
+    return () => clearInterval(interval);
   }, []);
 
   // Automatically swap active chart candles and reset timer when timeframe state changes
@@ -658,11 +741,72 @@ export function useEngine() {
          });
       }
 
+      // Dynamically reclassify zones based on relation to the new price in real-time
+      let anyZoneChanged = false;
+      const updatedZones = currentZones.map(z => {
+        const isResistance = z.price >= newPrice;
+        const currentIsResistance = z.type.includes('RESIST') || z.type.includes('HIGH');
+        
+        if (isResistance !== currentIsResistance) {
+          anyZoneChanged = true;
+          const tfUpper = (z.timeframe || '1m').toUpperCase();
+          let finalType = z.type;
+          let finalColor = z.color;
+          
+          if (z.timeframe === '1d') {
+            finalType = isResistance ? "1D SWING RESIST" : "1D SWING SUPPORT";
+            finalColor = isResistance ? "#f43f5e" : "#3b82f6";
+          } else {
+            finalType = isResistance ? `${tfUpper} RESIST` : `${tfUpper} SUPPORT`;
+            if (z.timeframe === '4h') {
+              finalColor = isResistance ? "#f59e0b" : "#10b981";
+            } else if (z.timeframe === '1h') {
+              finalColor = isResistance ? "#d946ef" : "#06b6d4";
+            } else if (z.timeframe === '15m') {
+              finalColor = isResistance ? "#84cc16" : "#a855f7";
+            } else { // 5m
+              finalColor = isResistance ? "#fb7185" : "#38bdf8";
+            }
+          }
+          
+          const criteria: string[] = [];
+          if (z.timeframe === '1d') {
+            criteria.push("Крайние точки диапазона (Swing): Абсолютный экстремум за 30 дней.");
+            criteria.push(isResistance ? "Пул ликвидности (HTF): Высокая плотность лимитных ордеров на продажу." : "Пул ликвидности (HTF): Высокая плотность лимитных ордеров на покупку.");
+            criteria.push("Объемный профиль: Крупный исторический горизонтальный узел.");
+          } else if (z.levelStrength === 'HTF') {
+            criteria.push(`Сильный разворот ${tfUpper}: Подтвержденная 3-барная структура.`);
+            criteria.push(isResistance ? "Защита уровня (Resist): Лимитные заявки продавцов (Ask blocks)." : "Защита уровня (Support): Лимитные заявки покупателей (Bid blocks).");
+            criteria.push("Подтверждение CVD: Обнаружены следы агрессивного поглощения.");
+          } else {
+            criteria.push(`Микро-свинг ${tfUpper}: Быстрый локальный экстремум.`);
+            criteria.push(isResistance ? "Зона предложения рынка: Возможный ложный пробой." : "Зона спроса рынка: Ожидаемая реакция покупателя.");
+            criteria.push("Краткосрочный импульс: Подходит для скальпинг-пробоев.");
+          }
+          
+          return {
+            ...z,
+            type: finalType,
+            color: finalColor,
+            updatedAt: new Date().toLocaleTimeString('ru-RU'),
+            validationCriteria: criteria
+          };
+        }
+        return z;
+      });
+      
+      let resolvedCurrentZones = currentZones;
+      if (anyZoneChanged) {
+        setZones(updatedZones);
+        zonesRef.current = updatedZones;
+        resolvedCurrentZones = updatedZones;
+      }
+
       // Recalculate precise distances to technical zones with finalized tick price
       minD = Infinity;
       nearestZoneIndex = -1;
       
-      currentZones.forEach((z, idx) => {
+      resolvedCurrentZones.forEach((z, idx) => {
         const dist = Math.abs(z.price - newPrice);
         if (dist < minD) {
           minD = dist;

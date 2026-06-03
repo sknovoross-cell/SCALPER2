@@ -186,7 +186,7 @@ export default function App() {
            )}
 
            {view === 'chart' && (
-             <MarketChart 
+             <MarketChart trades={trades} 
                data={chartData} 
                zones={zones} 
                timeframe={timeframe} 

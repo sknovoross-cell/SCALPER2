@@ -93,24 +93,6 @@ export function SettingsPanel({ config, onChange }: SettingsPanelProps) {
        </div>
 
       <div className="bg-[#0a0f1d]/80 border border-[#1a2233] rounded-lg p-3">
-        <h3 className="text-[#ef4444] font-bold mb-3 tracking-wider uppercase opacity-90">Risk Manager [Cold Path]</h3>
-        <div className="space-y-3 relative">
-           <label className="flex flex-col gap-1">
-             <span className="text-[#64748b] flex justify-between"><span>Max Daily DD %</span> <span className="text-[#e0e0e0]">{config.risk.maxDailyDDPct}</span></span>
-             <input type="range" min="1" max="20" step="0.5" className="accent-[#ef4444]" value={config.risk.maxDailyDDPct} onChange={e => onChange({risk: {...config.risk, maxDailyDDPct: parseFloat(e.target.value)}})} />
-           </label>
-           <label className="flex flex-col gap-1">
-             <span className="text-[#64748b] flex justify-between"><span>Kelly Fraction</span> <span className="text-[#e0e0e0]">{config.risk.kellyFraction}</span></span>
-             <input type="range" min="0.1" max="1" step="0.1" className="accent-[#ef4444]" value={config.risk.kellyFraction} onChange={e => onChange({risk: {...config.risk, kellyFraction: parseFloat(e.target.value)}})} />
-           </label>
-           <label className="flex flex-col gap-1">
-             <span className="text-[#64748b] flex justify-between"><span>ATR Stop Mult</span> <span className="text-[#e0e0e0]">{config.risk.atrStopMultiplier}</span></span>
-             <input type="range" min="0.5" max="3" step="0.1" className="accent-[#ef4444]" value={config.risk.atrStopMultiplier} onChange={e => onChange({risk: {...config.risk, atrStopMultiplier: parseFloat(e.target.value)}})} />
-           </label>
-        </div>
-      </div>
-
-      <div className="bg-[#0a0f1d]/80 border border-[#1a2233] rounded-lg p-3">
         <h3 className="text-[#38bdf8] font-bold mb-3 tracking-wider uppercase opacity-90">Filters [Rust Engine]</h3>
         <div className="space-y-3 relative">
            <label className="flex flex-col gap-1">

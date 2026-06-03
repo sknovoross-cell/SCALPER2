@@ -12,6 +12,8 @@ export interface LiquidityZone {
   color: string;
   levelStrength?: 'HTF' | 'LTF';
   timeframe?: string;
+  updatedAt?: string;
+  validationCriteria?: string[];
 }
 
 export interface TradePosition {
