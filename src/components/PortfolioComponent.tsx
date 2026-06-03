@@ -7,8 +7,11 @@ interface PortfolioComponentProps {
   accountEquity: number;
   realizedPnL: number;
   currentPrice: number;
-  onManualTrade: (side: 'BUY' | 'SELL') => void;
   onClosePosition: () => void;
+  feesPaid: number;
+  tradedVolumeBtc: number;
+  tradedVolumeUsd: number;
+  completedTradesCount: number;
 }
 
 export function PortfolioComponent({
@@ -17,9 +20,36 @@ export function PortfolioComponent({
   accountEquity,
   realizedPnL,
   currentPrice,
-  onManualTrade,
-  onClosePosition
+  onClosePosition,
+  feesPaid,
+  tradedVolumeBtc,
+  tradedVolumeUsd,
+  completedTradesCount
 }: PortfolioComponentProps) {
+  // Compute absolute TP & SL levels with dynamic or static presets
+  let tpPrice = position?.tpPrice;
+  let slPrice = position?.slPrice;
+
+  if (position && (!tpPrice || !slPrice)) {
+    const tf = position.timeframe || '1m';
+    const strat = position.strategyType || 'BREAKOUT';
+    const TF_TARGETS_STATIC: Record<string, Record<string, { tp: number; sl: number }>> = {
+      '1m': { BREAKOUT: { tp: 120.0, sl: 40.0 }, ABSORPTION_FADE: { tp: 80.0, sl: 50.0 } },
+      '5m': { BREAKOUT: { tp: 250.0, sl: 80.0 }, ABSORPTION_FADE: { tp: 160.0, sl: 100.0 } },
+      '15m': { BREAKOUT: { tp: 450.0, sl: 150.0 }, ABSORPTION_FADE: { tp: 300.0, sl: 180.0 } },
+      '1h': { BREAKOUT: { tp: 900.0, sl: 300.0 }, ABSORPTION_FADE: { tp: 600.0, sl: 350.0 } },
+      '4h': { BREAKOUT: { tp: 1800.0, sl: 600.0 }, ABSORPTION_FADE: { tp: 1200.0, sl: 700.0 } },
+      '1d': { BREAKOUT: { tp: 4000.0, sl: 1500.0 }, ABSORPTION_FADE: { tp: 2500.0, sl: 1800.0 } }
+    };
+    const target = TF_TARGETS_STATIC[tf]?.[strat] || TF_TARGETS_STATIC['1m']['BREAKOUT'];
+    if (position.side === 'BUY') {
+      tpPrice = position.entryPrice + target.tp;
+      slPrice = position.entryPrice - target.sl;
+    } else {
+      tpPrice = position.entryPrice - target.tp;
+      slPrice = position.entryPrice + target.sl;
+    }
+  }
   return (
     <div className="flex-1 flex flex-col gap-4 min-h-0 w-full z-10">
       
@@ -80,37 +110,41 @@ export function PortfolioComponent({
       {/* 2. Middle Row: Terminal (Manual Trading Interface) & Active Position info */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         
-        {/* Terminal Controls */}
-        <div className="bg-[#0a0f1d]/85 border border-[#1a2233] rounded-lg p-5 flex flex-col">
-          <div className="flex items-center gap-2 mb-3">
-            <Zap className="w-4 h-4 text-[#38bdf8]" />
-            <h3 className="text-xs font-bold text-[#e0e0e0] uppercase tracking-wider">Ручной Торговый Терминал (Fast Paper Execution)</h3>
-          </div>
-          <p className="text-[10px] text-[#64748b] mb-4">
-            Торгуйте в бумажном (Paper-trade) режиме в один клик по реальным котировкам Binance Futures. Система автоматически создаст позицию и рассчитает PnL.
-          </p>
+        {/* Trading Statistics & Commissions */}
+        <div className="bg-[#0a0f1d]/85 border border-[#1a2233] rounded-lg p-5 flex flex-col justify-between">
+          <div>
+            <div className="flex items-center gap-2 mb-3">
+              <TrendingUp className="w-4 h-4 text-[#00ff41]" />
+              <h3 className="text-xs font-bold text-[#e0e0e0] uppercase tracking-wider">Статистика сделок и комиссий</h3>
+            </div>
+            <p className="text-[10px] text-[#64748b] mb-4 uppercase tracking-wider">
+              Базовые системные показатели проторгованного объема и торговых издержек за сессию
+            </p>
 
-          <div className="grid grid-cols-2 gap-4 mb-4">
-            <button
-              onClick={() => onManualTrade('BUY')}
-              className="py-3 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/40 hover:border-emerald-500 text-[#00ff41] rounded-lg transition-all font-bold text-xs uppercase flex flex-col items-center justify-center gap-1 active:scale-95"
-            >
-              <ArrowUpRight className="w-5 h-5 text-[#00ff41]" />
-              BUY Long
-              <span className="text-[9px] font-normal text-sky-400 font-mono">0.5 BTC @ Market</span>
-            </button>
-            
-            <button
-              onClick={() => onManualTrade('SELL')}
-              className="py-3 bg-red-500/10 hover:bg-red-500/20 border border-red-500/40 hover:border-red-500 text-red-400 rounded-lg transition-all font-bold text-xs uppercase flex flex-col items-center justify-center gap-1 active:scale-95"
-            >
-              <ArrowDownRight className="w-5 h-5 text-red-500" />
-              SELL Short
-              <span className="text-[9px] font-normal text-sky-400 font-mono">0.5 BTC @ Market</span>
-            </button>
+            <div className="space-y-2 font-mono">
+              <div className="flex justify-between items-center p-2.5 bg-black/20 rounded border border-[#1a2233]">
+                <span className="text-[10px] text-[#64748b] uppercase">Количество сделок (Completed Trades)</span>
+                <span className="text-xs font-bold text-[#00ff41]">{completedTradesCount}</span>
+              </div>
+
+              <div className="flex justify-between items-center p-2.5 bg-black/20 rounded border border-[#1a2233]">
+                <span className="text-[10px] text-[#64748b] uppercase">Проторгованный объем BTC</span>
+                <span className="text-xs font-bold text-[#38bdf8]">{tradedVolumeBtc.toFixed(4)} BTC</span>
+              </div>
+
+              <div className="flex justify-between items-center p-2.5 bg-black/20 rounded border border-[#1a2233]">
+                <span className="text-[10px] text-[#64748b] uppercase">Проторгованный объем USD</span>
+                <span className="text-xs font-bold text-[#e0e0e0]">${tradedVolumeUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+              </div>
+
+              <div className="flex justify-between items-center p-2.5 bg-black/20 rounded border border-[#1a2233]">
+                <span className="text-[10px] text-[#64748b] uppercase">Уплаченные комиссии (Fees Paid)</span>
+                <span className="text-xs font-bold text-red-400">${feesPaid.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}</span>
+              </div>
+            </div>
           </div>
 
-          <div className="bg-black/30 p-3 rounded border border-[#1a2233] mt-auto">
+          <div className="bg-black/30 p-3 rounded border border-[#1a2233] mt-4">
              <div className="flex justify-between items-center text-[10px]">
                 <span className="text-[#64748b]">Leverage Config</span>
                 <span className="text-[#38bdf8] font-mono">Isolated 10x</span>
@@ -155,6 +189,23 @@ export function PortfolioComponent({
                   <div>
                      <p className="text-[10px] text-[#64748b] uppercase">Маржа (10x Leverage)</p>
                      <p className="text-sm font-mono font-bold text-[#e0e0e0] mt-0.5">${((position.entryPrice * position.size) / 10).toFixed(2)}</p>
+                  </div>
+               </div>
+
+               <div className="grid grid-cols-2 gap-4 pt-3 pb-3 border-t border-[#1a2233]">
+                  <div>
+                     <p className="text-[10px] text-[#64748b] uppercase flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-[#00ff41]"></span>
+                        Тейк-Профит (Take Profit)
+                     </p>
+                     <p className="text-sm font-mono font-bold text-[#00ff41] mt-0.5">${tpPrice?.toFixed(2)}</p>
+                  </div>
+                  <div>
+                     <p className="text-[10px] text-[#64748b] uppercase flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-red-500"></span>
+                        Стоп-Лосс (Stop Loss)
+                     </p>
+                     <p className="text-sm font-mono font-bold text-red-400 mt-0.5">${slPrice?.toFixed(2)}</p>
                   </div>
                </div>
 

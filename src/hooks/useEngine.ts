@@ -26,12 +26,91 @@ const INITIAL_CONFIG: AppConfig = {
     entryType: "aggressive_limit",
     maxSlippageTicks: 3,
     tpRr: "1.5, 3.0",
-    timeExitSec: 300
+    timeExitSec: 300,
+    breakevenEnabled: true,
+    trailingStopEnabled: true,
+    partialTakeProfitEnabled: true,
+    signalExitEnabled: true,
+    feeExitEnabled: false
   }
 };
 
+const TF_TARGETS: Record<string, Record<string, { tp: number; sl: number; timeExitSec: number }>> = {
+  '1m': {
+    BREAKOUT: { tp: 120.0, sl: 40.0, timeExitSec: 300 },
+    ABSORPTION_FADE: { tp: 80.0, sl: 50.0, timeExitSec: 300 }
+  },
+  '5m': {
+    BREAKOUT: { tp: 250.0, sl: 80.0, timeExitSec: 1200 },
+    ABSORPTION_FADE: { tp: 160.0, sl: 100.0, timeExitSec: 1200 }
+  },
+  '15m': {
+    BREAKOUT: { tp: 450.0, sl: 150.0, timeExitSec: 3600 },
+    ABSORPTION_FADE: { tp: 300.0, sl: 180.0, timeExitSec: 3600 }
+  },
+  '1h': {
+    BREAKOUT: { tp: 900.0, sl: 300.0, timeExitSec: 14400 },
+    ABSORPTION_FADE: { tp: 600.0, sl: 350.0, timeExitSec: 14400 }
+  },
+  '4h': {
+    BREAKOUT: { tp: 1800.0, sl: 600.0, timeExitSec: 57600 },
+    ABSORPTION_FADE: { tp: 1200.0, sl: 700.0, timeExitSec: 57600 }
+  },
+  '1d': {
+    BREAKOUT: { tp: 4000.0, sl: 1500.0, timeExitSec: 172800 },
+    ABSORPTION_FADE: { tp: 2500.0, sl: 1800.0, timeExitSec: 172800 }
+  }
+};
+
+export function calculateTargetPrices(
+  side: 'BUY' | 'SELL',
+  entryPrice: number,
+  strategyType: 'BREAKOUT' | 'ABSORPTION_FADE',
+  timeframe: string,
+  feeExitEnabled?: boolean
+): { tpPrice: number; slPrice: number } {
+  if (feeExitEnabled) {
+    const entryFeeRate = strategyType === 'BREAKOUT' ? 0.0004 : 0.0002;
+    const tpPct = entryFeeRate + 0.0002 + 0.001; // Round-trip fee (TP maker) + 0.1%
+    const slPct = entryFeeRate + 0.0004 + 0.001; // Round-trip fee (SL taker) + 0.1%
+    if (side === 'BUY') {
+      return {
+        tpPrice: entryPrice * (1 + tpPct),
+        slPrice: entryPrice * (1 - slPct)
+      };
+    } else {
+      return {
+        tpPrice: entryPrice * (1 - tpPct),
+        slPrice: entryPrice * (1 + slPct)
+      };
+    }
+  }
+
+  const tfKey = timeframe || '1m';
+  const targets = TF_TARGETS[tfKey] || TF_TARGETS['1m'];
+  const strategy = strategyType || 'BREAKOUT';
+  const targetConfig = targets[strategy] || targets['BREAKOUT'];
+  
+  const tp = targetConfig.tp;
+  const sl = targetConfig.sl;
+
+  if (side === 'BUY') {
+    return {
+      tpPrice: entryPrice + tp,
+      slPrice: entryPrice - sl
+    };
+  } else {
+    return {
+      tpPrice: entryPrice - tp,
+      slPrice: entryPrice + sl
+    };
+  }
+}
+
 export function useEngine() {
   const [config, setConfig] = useState<AppConfig>(INITIAL_CONFIG);
+  const configRef = useRef<AppConfig>(config);
+  configRef.current = config;
   const [state, setState] = useState<MachineState>('SCANNING');
   const stateRef = useRef<MachineState>('SCANNING');
   stateRef.current = state;
@@ -50,6 +129,10 @@ export function useEngine() {
   const [trades, setTrades] = useState<HistorisedTrade[]>([]);
   const [accountEquity, setAccountEquity] = useState<number>(12450.0);
   const [realizedPnL, setRealizedPnL] = useState<number>(0);
+  const [feesPaid, setFeesPaid] = useState<number>(0);
+  const [tradedVolumeBtc, setTradedVolumeBtc] = useState<number>(0);
+  const [tradedVolumeUsd, setTradedVolumeUsd] = useState<number>(0);
+  const [completedTradesCount, setCompletedTradesCount] = useState<number>(0);
 
   const [wsStatus, setWsStatus] = useState<string>("CONNECTING");
   const wsStatusRef = useRef<string>("CONNECTING");
@@ -613,7 +696,7 @@ export function useEngine() {
               const isNearResistance = nearestZone ? (nearestZone.type.includes('RES') || nearestZone.type.includes('HIGH')) : false;
               const isNearSupport = nearestZone ? (nearestZone.type.includes('SUP') || nearestZone.type.includes('LOW')) : false;
 
-              const isTapeAccelerated = tapeAcceleration > (config.filters.tapeSpeedMultiplier || 3.0);
+              const isTapeAccelerated = tapeAcceleration > (configRef.current.filters.tapeSpeedMultiplier || 3.0);
 
               let triggerEntrySide: 'BUY' | 'SELL' | null = null;
               let chosenStratType: 'BREAKOUT' | 'ABSORPTION_FADE' | null = null;
@@ -655,6 +738,19 @@ export function useEngine() {
                     const isLtfLevel = nearestZone?.levelStrength === 'LTF';
                      const positionSize = isLtfLevel ? 0.25 : 0.5; // Halve volume for lower timeframe levels to mitigate noise-risk
                     
+                    const isBreakout = chosenStratType === 'BREAKOUT';
+                    const entryFeeRate = isBreakout ? 0.0004 : 0.0002;
+                    const entryFee = newPrice * positionSize * entryFeeRate;
+
+                    setFeesPaid(f => f + entryFee);
+                    setTradedVolumeBtc(v => v + positionSize);
+                    setTradedVolumeUsd(v => v + (positionSize * newPrice));
+                    setAccountEquity(eq => eq - entryFee);
+                    setRealizedPnL(p => p - entryFee);
+
+                    const posTf = nearestZone?.timeframe || activeTf;
+                    const { tpPrice, slPrice } = calculateTargetPrices(triggerEntrySide, newPrice, chosenStratType, posTf, configRef.current.execution.feeExitEnabled);
+
                     const newPos: TradePosition = {
                        side: triggerEntrySide,
                        entryPrice: newPrice,
@@ -663,7 +759,12 @@ export function useEngine() {
                        unrealizedPnLPct: 0,
                        timestamp: new Date().toLocaleTimeString('ru-RU'),
                        createdAt: Date.now(),
-                       strategyType: chosenStratType
+                       strategyType: chosenStratType,
+                       timeframe: posTf,
+                       tpPrice,
+                       slPrice,
+                       maxFavPrice: newPrice,
+                       hasPartialTP: false
                     };
                     setPosition(newPos);
 
@@ -702,33 +803,235 @@ export function useEngine() {
               
               const elapsedMs = Date.now() - (active.createdAt || Date.now());
               const elapsedSec = elapsedMs / 1000;
-              const maxDuration = config.execution.timeExitSec || 300;
-              const isTimeExit = elapsedSec >= maxDuration;
 
-              // BREAKOUT seeks larger momentum runs; ABSORPTION FADE targets quicker mean-reversion bounces
-              let tpTarget = 18.0;
-              let slTarget = -12.0;
-              if (active.strategyType === 'BREAKOUT') {
-                 tpTarget = 24.0;
-                 slTarget = -10.0;
-              } else if (active.strategyType === 'ABSORPTION_FADE') {
-                 tpTarget = 15.0;
-                 slTarget = -11.0;
+              const tfKey = active.timeframe || activeTf || '1m';
+              const targets = TF_TARGETS[tfKey] || TF_TARGETS['1m'];
+              const strategy = (active.strategyType || 'BREAKOUT') as 'BREAKOUT' | 'ABSORPTION_FADE';
+              const targetConfig = targets[strategy] || targets['BREAKOUT'];
+
+              const tpTarget = targetConfig.tp;
+              const slTarget = targetConfig.sl;
+              const maxDuration = targetConfig.timeExitSec;
+
+              // Active Position Management: Breakeven, Trailing Stop, Partial Take Profit
+              let currentMaxFavPrice = active.maxFavPrice || active.entryPrice;
+              if (active.side === 'BUY') {
+                 if (newPrice > currentMaxFavPrice) {
+                    currentMaxFavPrice = newPrice;
+                 }
+              } else {
+                 if (newPrice < currentMaxFavPrice) {
+                    currentMaxFavPrice = newPrice;
+                 }
               }
 
-              const isTP = pathPnL >= tpTarget;
-              const isSL = pathPnL <= slTarget;
-              const triggerExit = isTP || isSL || isTimeExit;
+              let updatedSlPrice = active.slPrice;
+              let updatedTpPrice = active.tpPrice;
+              let updatedSize = active.size;
+              let updatedHasPartialTP = active.hasPartialTP;
+
+              if (configRef.current.execution.feeExitEnabled) {
+                 const entryFeeRate = active.strategyType === 'BREAKOUT' ? 0.0004 : 0.0002;
+                 const tpPct = entryFeeRate + 0.0002 + 0.001; // Round-trip fee (TP maker) + 0.1%
+                 const slPct = entryFeeRate + 0.0004 + 0.001; // Round-trip fee (SL taker) + 0.1%
+                 if (active.side === 'BUY') {
+                    updatedTpPrice = active.entryPrice * (1 + tpPct);
+                    updatedSlPrice = active.entryPrice * (1 - slPct);
+                 } else {
+                    updatedTpPrice = active.entryPrice * (1 - tpPct);
+                    updatedSlPrice = active.entryPrice * (1 + slPct);
+                 }
+              }
+
+              // 1. Breakeven logic
+              if (configRef.current.execution.breakevenEnabled && !configRef.current.execution.feeExitEnabled) {
+                 if (active.side === 'BUY') {
+                    // If profit reaches 40% of TP target, move SL to entry price
+                    if (pathPnL >= tpTarget * 0.4 && (updatedSlPrice === undefined || updatedSlPrice < active.entryPrice)) {
+                       updatedSlPrice = active.entryPrice;
+                       setSignals(s => [{
+                          id: Math.random().toString(36).substr(2, 9),
+                          timestamp: new Date().toISOString(),
+                          type: 'SYSTEM_ALERT',
+                          side: 'BUY',
+                          price: newPrice,
+                          message: `🛡️ Breakeven SL activated for BUY position at $${active.entryPrice.toFixed(1)}`
+                       }, ...s].slice(0, 50));
+                    }
+                 } else {
+                    if (pathPnL >= tpTarget * 0.4 && (updatedSlPrice === undefined || updatedSlPrice > active.entryPrice)) {
+                       updatedSlPrice = active.entryPrice;
+                       setSignals(s => [{
+                          id: Math.random().toString(36).substr(2, 9),
+                          timestamp: new Date().toISOString(),
+                          type: 'SYSTEM_ALERT',
+                          side: 'SELL',
+                          price: newPrice,
+                          message: `🛡️ Breakeven SL activated for SELL position at $${active.entryPrice.toFixed(1)}`
+                       }, ...s].slice(0, 50));
+                    }
+                 }
+              }
+
+              // 2. Trailing Stop logic
+              if (configRef.current.execution.trailingStopEnabled && !configRef.current.execution.feeExitEnabled) {
+                 if (active.side === 'BUY') {
+                    const trailSl = currentMaxFavPrice - slTarget;
+                    if (updatedSlPrice === undefined || trailSl > updatedSlPrice) {
+                       updatedSlPrice = trailSl;
+                    }
+                 } else {
+                    const trailSl = currentMaxFavPrice + slTarget;
+                    if (updatedSlPrice === undefined || trailSl < updatedSlPrice) {
+                       updatedSlPrice = trailSl;
+                    }
+                 }
+              }
+
+              // 3. Partial Take Profit (50% position scaling)
+              if (configRef.current.execution.partialTakeProfitEnabled && !updatedHasPartialTP && !configRef.current.execution.feeExitEnabled) {
+                 const nearestZoneForPartial = nearestZoneIndex !== -1 ? currentZones[nearestZoneIndex] : null;
+                 const isAtOpposingLevel = nearestZoneForPartial && (
+                    (active.side === 'BUY' && (nearestZoneForPartial.type.includes('RES') || nearestZoneForPartial.type.includes('HIGH')) && minD < 15) ||
+                    (active.side === 'SELL' && (nearestZoneForPartial.type.includes('SUP') || nearestZoneForPartial.type.includes('LOW')) && minD < 15)
+                 );
+
+                 // If profit reaches 50% of the main TP target OR we hit an opposing level with positive profit, secure 50% size
+                 if (pathPnL >= tpTarget * 0.5 || (isAtOpposingLevel && pathPnL > 0)) {
+                    const partSize = active.size * 0.5;
+                    updatedSize = active.size - partSize;
+                    updatedHasPartialTP = true;
+
+                    const partPnL = pathPnL * partSize;
+                    const partExitFee = newPrice * partSize * 0.0002;
+                    
+                    setFeesPaid(f => f + partExitFee);
+                    setTradedVolumeBtc(v => v + partSize);
+                    setTradedVolumeUsd(v => v + (partSize * newPrice));
+                    
+                    setRealizedPnL(p => p + partPnL - partExitFee);
+                    setAccountEquity(eq => eq + partPnL - partExitFee);
+
+                    setTrades(t => [{
+                       id: Math.random().toString(36).substr(2, 9),
+                       timestamp: new Date().toLocaleTimeString('ru-RU'),
+                       type: `${active.strategyType === 'BREAKOUT' ? 'BO' : 'FADE'} PARTIAL CLOSE`,
+                       side: active.side === 'BUY' ? 'SELL' : 'BUY',
+                       price: newPrice,
+                       size: partSize,
+                       pnl: partPnL - partExitFee,
+                       strategyType: active.strategyType
+                    }, ...t]);
+
+                    const isTriggeredByOpposingLevel = isAtOpposingLevel && pathPnL > 0 && pathPnL < tpTarget * 0.5;
+                    const msgText = isTriggeredByOpposingLevel 
+                       ? `💰 Secured 50% profit at opposing level (${nearestZoneForPartial?.type || 'LEVEL'}) at $${newPrice.toFixed(1)}`
+                       : `💰 Secured 50% profit (Partial TP) at $${newPrice.toFixed(1)}`;
+
+                    setSignals(s => [{
+                       id: Math.random().toString(36).substr(2, 9),
+                       timestamp: new Date().toISOString(),
+                       type: 'SYSTEM_ALERT',
+                       side: active.side,
+                       price: newPrice,
+                       message: msgText
+                    }, ...s].slice(0, 50));
+                 }
+              }
+
+              // Save structural updates to the active position
+              if (
+                 updatedSlPrice !== active.slPrice || 
+                 updatedSize !== active.size ||
+                 updatedHasPartialTP !== active.hasPartialTP ||
+                 currentMaxFavPrice !== active.maxFavPrice
+              ) {
+                 setPosition({
+                    ...active,
+                    slPrice: updatedSlPrice,
+                    tpPrice: updatedTpPrice,
+                    size: updatedSize,
+                    hasPartialTP: updatedHasPartialTP,
+                    maxFavPrice: currentMaxFavPrice
+                 });
+              }
+
+              // 4. Opposing Signal / Technical Exit
+              let hasOpposingSignalExit = false;
+              if (configRef.current.execution.signalExitEnabled) {
+                 const nearestZone = nearestZoneIndex !== -1 ? currentZones[nearestZoneIndex] : null;
+                 const isNearResistance = nearestZone ? (nearestZone.type.includes('RES') || nearestZone.type.includes('HIGH')) : false;
+                 const isNearSupport = nearestZone ? (nearestZone.type.includes('SUP') || nearestZone.type.includes('LOW')) : false;
+                 const isTapeAccelerated = tapeAcceleration > (configRef.current.filters.tapeSpeedMultiplier || 3.0);
+
+                 if (active.side === 'BUY') {
+                    const isOpposingAbsorption = isNearResistance && isTapeAccelerated && cvdDelta < -0.2;
+                    const isOpposingBreakout = isNearSupport && isTapeAccelerated && cvdDelta < -0.4;
+                    if (isOpposingAbsorption || isOpposingBreakout) {
+                       hasOpposingSignalExit = true;
+                       const reason = isOpposingAbsorption 
+                          ? `Large seller absorption detected at resistance (${nearestZone?.type || ''}) with CVD Delta ${cvdDelta.toFixed(2)}k` 
+                          : `Opposing breakdown breakout triggered at support (${nearestZone?.type || ''}) with CVD Delta ${cvdDelta.toFixed(2)}k`;
+                       
+                       setSignals(s => [{
+                          id: Math.random().toString(36).substr(2, 9),
+                          timestamp: new Date().toISOString(),
+                          type: 'SYSTEM_ALERT',
+                          side: 'SELL',
+                          price: newPrice,
+                          message: `⚡ Technical Signal Exit triggered for BUY position: ${reason}`
+                       }, ...s].slice(0, 50));
+                    }
+                 } else {
+                    const isOpposingAbsorption = isNearSupport && isTapeAccelerated && cvdDelta > 0.2;
+                    const isOpposingBreakout = isNearResistance && isTapeAccelerated && cvdDelta > 0.4;
+                    if (isOpposingAbsorption || isOpposingBreakout) {
+                       hasOpposingSignalExit = true;
+                       const reason = isOpposingAbsorption 
+                          ? `Passive buyer absorption detected at support (${nearestZone?.type || ''}) with CVD Delta +${cvdDelta.toFixed(2)}k` 
+                          : `Opposing breakout triggered at resistance (${nearestZone?.type || ''}) with CVD Delta +${cvdDelta.toFixed(2)}k`;
+                       
+                       setSignals(s => [{
+                          id: Math.random().toString(36).substr(2, 9),
+                          timestamp: new Date().toISOString(),
+                          type: 'SYSTEM_ALERT',
+                          side: 'BUY',
+                          price: newPrice,
+                          message: `⚡ Technical Signal Exit triggered for SELL position: ${reason}`
+                       }, ...s].slice(0, 50));
+                    }
+                 }
+              }
+
+              const isTimeExit = elapsedSec >= maxDuration;
+              const isTP = active.side === 'BUY'
+                 ? newPrice >= (updatedTpPrice ?? (active.entryPrice + tpTarget))
+                 : newPrice <= (updatedTpPrice ?? (active.entryPrice - tpTarget));
+              const isSL = active.side === 'BUY'
+                 ? newPrice <= (updatedSlPrice ?? (active.entryPrice - slTarget))
+                 : newPrice >= (updatedSlPrice ?? (active.entryPrice + slTarget));
+              const isSignalExit = hasOpposingSignalExit;
+              const triggerExit = isTP || isSL || isTimeExit || isSignalExit;
 
               if (triggerExit) {
+                 const entryFeeRate = active.strategyType === 'BREAKOUT' ? 0.0004 : 0.0002;
+                 const entryFee = active.entryPrice * active.size * entryFeeRate;
+                 const exitFeeRate = isTP ? 0.0002 : 0.0004;
+                 const exitFee = newPrice * active.size * exitFeeRate;
+
+                 setFeesPaid(f => f + exitFee);
+                 setTradedVolumeBtc(v => v + active.size);
+                 setTradedVolumeUsd(v => v + (active.size * newPrice));
+                 setCompletedTradesCount(c => c + 1);
+
                  const finalRealizedPnL = pathPnL * active.size;
-                 setRealizedPnL(p => p + finalRealizedPnL);
-                 setAccountEquity(eq => eq + finalRealizedPnL);
+                 setRealizedPnL(p => p + finalRealizedPnL - exitFee);
+                 setAccountEquity(eq => eq + finalRealizedPnL - exitFee);
 
                  // Drop model open interest on trade closures (liquidations or position offsets)
                  oiRef.current -= (Math.random() * 0.15 + 0.05);
                  
-                 const exitType = isTP ? 'TAKE PROFIT' : (isSL ? 'STOP LOSS' : 'TIME EXIT (AUTO)');
+                 const exitType = isTP ? 'TAKE PROFIT' : (isSL ? 'STOP LOSS' : (isSignalExit ? 'SIGNAL EXIT' : 'TIME EXIT (AUTO)'));
 
                  setTrades(t => [{
                     id: Math.random().toString(36).substr(2, 9),
@@ -737,7 +1040,7 @@ export function useEngine() {
                     side: active.side === 'BUY' ? 'SELL' : 'BUY',
                     price: newPrice,
                     size: active.size,
-                    pnl: finalRealizedPnL,
+                    pnl: finalRealizedPnL - entryFee - exitFee,
                     strategyType: active.strategyType
                  }, ...t]);
 
@@ -815,6 +1118,9 @@ export function useEngine() {
        }, ...t]);
     }
 
+    const manualTf = timeframeRef.current || '1m';
+    const { tpPrice, slPrice } = calculateTargetPrices(side, currentPrice, 'BREAKOUT', manualTf, configRef.current.execution.feeExitEnabled);
+
     const newPos: TradePosition = {
        side,
        entryPrice: currentPrice,
@@ -822,7 +1128,13 @@ export function useEngine() {
        unrealizedPnL: 0,
        unrealizedPnLPct: 0,
        timestamp: new Date().toLocaleTimeString('ru-RU'),
-       createdAt: Date.now()
+       createdAt: Date.now(),
+       timeframe: manualTf,
+       strategyType: 'BREAKOUT',
+       tpPrice,
+       slPrice,
+       maxFavPrice: currentPrice,
+       hasPartialTP: false
     };
     setPosition(newPos);
     setState('POSITION_OPEN');
@@ -853,9 +1165,19 @@ export function useEngine() {
     const currentPrice = aggRef.current.lastPrice || (chartData.length > 0 ? chartData[chartData.length - 1].close : 64500);
     const diff = currentPrice - active.entryPrice;
     const pathPnL = active.side === 'BUY' ? diff : -diff;
+
+    const entryFeeRate = active.strategyType === 'BREAKOUT' ? 0.0004 : 0.0002;
+    const entryFee = active.entryPrice * active.size * entryFeeRate;
+    const exitFee = currentPrice * active.size * 0.0004;
+
+    setFeesPaid(f => f + exitFee);
+    setTradedVolumeBtc(v => v + active.size);
+    setTradedVolumeUsd(v => v + (active.size * currentPrice));
+    setCompletedTradesCount(c => c + 1);
+
     const finalRealizedPnL = pathPnL * active.size;
-    setRealizedPnL(p => p + finalRealizedPnL);
-    setAccountEquity(eq => eq + finalRealizedPnL);
+    setRealizedPnL(p => p + finalRealizedPnL - exitFee);
+    setAccountEquity(eq => eq + finalRealizedPnL - exitFee);
     
     setTrades(t => [{
        id: Math.random().toString(36).substr(2, 9),
@@ -864,7 +1186,7 @@ export function useEngine() {
        side: active.side === 'BUY' ? 'SELL' : 'BUY',
        price: currentPrice,
        size: active.size,
-       pnl: finalRealizedPnL
+       pnl: finalRealizedPnL - entryFee - exitFee
     }, ...t]);
 
     setPosition(null);
@@ -899,6 +1221,10 @@ export function useEngine() {
     closePosition,
     wsStatus,
     timeframe,
-    setTimeframe
+    setTimeframe,
+    feesPaid,
+    tradedVolumeBtc,
+    tradedVolumeUsd,
+    completedTradesCount
   };
 }

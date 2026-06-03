@@ -23,6 +23,11 @@ export interface TradePosition {
   timestamp: string;
   createdAt?: number;
   strategyType?: 'BREAKOUT' | 'ABSORPTION_FADE';
+  timeframe?: string;
+  tpPrice?: number;
+  slPrice?: number;
+  maxFavPrice?: number;
+  hasPartialTP?: boolean;
 }
 
 export interface HistorisedTrade {
@@ -62,6 +67,11 @@ export interface AppConfig {
     maxSlippageTicks: number;
     tpRr: string;
     timeExitSec: number;
+    breakevenEnabled: boolean;
+    trailingStopEnabled: boolean;
+    partialTakeProfitEnabled: boolean;
+    signalExitEnabled: boolean;
+    feeExitEnabled: boolean;
   };
 }
 

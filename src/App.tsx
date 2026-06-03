@@ -6,7 +6,7 @@ import { SignalLog } from './components/SignalLog';
 import { MarketChart } from './components/MarketChart';
 import { PortfolioComponent } from './components/PortfolioComponent';
 import { useEngine } from './hooks/useEngine';
-import { Activity, LayoutDashboard, BarChart2, Briefcase, Terminal, X } from 'lucide-react';
+import { Activity, LayoutDashboard, BarChart2, Briefcase, Terminal, X, Play, Pause } from 'lucide-react';
 
 export default function App() {
   const {
@@ -24,11 +24,14 @@ export default function App() {
     trades,
     accountEquity,
     realizedPnL,
-    executeManualTrade,
     closePosition,
     wsStatus,
     timeframe,
-    setTimeframe
+    setTimeframe,
+    feesPaid,
+    tradedVolumeBtc,
+    tradedVolumeUsd,
+    completedTradesCount
   } = useEngine();
 
   const [view, setView] = useState<'dashboard' | 'chart' | 'portfolio'>('dashboard');
@@ -95,18 +98,34 @@ export default function App() {
           </div>
           <div className="flex flex-col">
             <span className="text-[10px] text-[#64748b] uppercase">Статус Системы</span>
-            <span className={`text-sm font-bold ${halted ? 'text-[#ef4444]' : 'text-[#f59e0b]'}`}>{halted ? 'HALTED' : state}</span>
+            <span className={`text-sm font-bold ${halted ? 'text-[#ef4444]' : 'text-emerald-400'}`}>{halted ? 'HALTED' : state}</span>
           </div>
-          <button 
-            onClick={toggleHalt}
-            className={`px-4 py-1.5 text-[10px] font-bold rounded border transition-all select-none
-             ${halted 
-               ? 'bg-[#ef4444] text-white border-white/10 hover:bg-red-600 active:scale-95 shadow-[0_0_8px_#ef4444]' 
-               : 'bg-transparent text-[#ef4444] border-[#ef4444] hover:bg-[#ef4444]/20 active:scale-95'}
-            `}
-          >
-             KILL SWITCH
-          </button>
+          <div className="flex items-center gap-2">
+            <button 
+              onClick={toggleHalt}
+              className={`px-4 py-1.5 text-[10px] uppercase font-bold rounded border transition-all select-none flex items-center gap-1
+               ${halted 
+                 ? 'bg-[#00ff41] text-[#0a0f1d] border-[#00ff41] hover:bg-[#00dd35] active:scale-95 shadow-[0_0_10px_rgba(0,255,65,0.4)]' 
+                 : 'bg-[#ef4444]/15 text-[#ef4444] border-[#ef4444]/30 hover:bg-[#ef4444]/25 active:scale-95'}
+              `}
+              title={halted ? "Запустить торгового робота" : "Остановить торгового робота"}
+            >
+               {halted ? <Play className="w-3 h-3 fill-current" /> : <Pause className="w-3 h-3 fill-current" />}
+               {halted ? 'СТАРТ' : 'СТОП'}
+            </button>
+            <button 
+              onClick={toggleHalt}
+              className={`px-3 py-1.5 text-[10px] font-bold rounded border transition-all select-none
+               ${halted 
+                 ? 'bg-[#ef4444]/10 text-[#64748b] border-[#1a2233] cursor-not-allowed opacity-40' 
+                 : 'bg-transparent text-[#ef4444] border-[#ef4444]/40 hover:bg-[#ef4444]/15 active:scale-95'}
+              `}
+              disabled={halted}
+              title="Экстренная остановка всех процессов робота"
+            >
+               KILL SWITCH
+            </button>
+          </div>
         </div>
       </header>
 
@@ -182,8 +201,11 @@ export default function App() {
                accountEquity={accountEquity}
                realizedPnL={realizedPnL}
                currentPrice={currentPriceRaw}
-               onManualTrade={executeManualTrade}
                onClosePosition={closePosition}
+               feesPaid={feesPaid}
+               tradedVolumeBtc={tradedVolumeBtc}
+               tradedVolumeUsd={tradedVolumeUsd}
+               completedTradesCount={completedTradesCount}
              />
            )}
            
