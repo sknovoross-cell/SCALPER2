@@ -1,0 +1,6 @@
+{
+  "name": "ILBS-v1 Dashboard",
+  "description": "Интерфейс управления Institutional Liquidity Breakout Scalper (ILBS-v1)",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
