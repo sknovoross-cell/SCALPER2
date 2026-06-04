@@ -35,6 +35,7 @@ export default function App() {
   } = useEngine();
 
   const [view, setView] = useState<'dashboard' | 'chart' | 'portfolio'>('dashboard');
+  const [chartFullscreen, setChartFullscreen] = useState(false);
   const [logs, setLogs] = useState<{ time: string; level: string; message: string }[]>([]);
   const [showLogs, setShowLogs] = useState(false);
 
@@ -66,77 +67,79 @@ export default function App() {
       <div className="absolute inset-0 pointer-events-none opacity-20 bg-[radial-gradient(circle_at_50%_0%,#1e3a8a_0%,transparent_50%)]"></div>
 
       {/* Topbar */}
-      <header className="flex justify-between items-center border-b border-[#1a2233] p-4 shrink-0 z-10 bg-transparent">
-        <div className="flex items-center gap-4">
-          <div className="w-3 h-3 rounded-full bg-[#00ff41] shadow-[0_0_8px_#00ff41] animate-pulse"></div>
-          <div>
-            <h1 className="text-lg font-bold tracking-tighter text-[#00ff41] flex items-center gap-2"><Activity className="w-5 h-5" /> ILBS-v1</h1>
-            <p className="text-[10px] text-[#64748b] uppercase tracking-[0.2em]">QuantArchitect-Prime | SOTA 2024-2026</p>
-          </div>
-        </div>
-
-        <div className="flex gap-8 text-right items-center">
-          <div className="flex bg-[#1a2233]/40 p-1 rounded gap-1 mr-2 border border-[#1a2233]">
-            <button onClick={() => setView('dashboard')} className={`px-3 py-1 rounded text-[10px] font-bold tracking-wider transition-colors hover:text-[#00ff41] ${view === 'dashboard' ? 'bg-[#0a0f1d] text-[#e0e0e0] border border-[#1a2233]' : 'text-[#64748b] border border-transparent'}`}>
-              <LayoutDashboard className="w-3 h-3 inline mr-1 -mt-0.5"/> ДАШБОРД
-            </button>
-            <button onClick={() => setView('chart')} className={`px-3 py-1 rounded text-[10px] font-bold tracking-wider transition-colors hover:text-[#38bdf8] ${view === 'chart' ? 'bg-[#0a0f1d] text-[#e0e0e0] border border-[#1a2233]' : 'text-[#64748b] border border-transparent'}`}>
-              <BarChart2 className="w-3 h-3 inline mr-1 -mt-0.5"/> ГРАФИК ЛИКВИДНОСТИ
-            </button>
-            <button onClick={() => setView('portfolio')} className={`px-3 py-1 rounded text-[10px] font-bold tracking-wider transition-colors hover:text-[#f59e0b] ${view === 'portfolio' ? 'bg-[#0a0f1d] text-[#e0e0e0] border border-[#1a2233]' : 'text-[#64748b] border border-transparent'}`}>
-              <Briefcase className="w-3 h-3 inline mr-1 -mt-0.5"/> СДЕЛКИ И PNL
-            </button>
+      {!chartFullscreen && (
+        <header className="flex justify-between items-center border-b border-[#1a2233] p-4 shrink-0 z-10 bg-transparent">
+          <div className="flex items-center gap-4">
+            <div className="w-3 h-3 rounded-full bg-[#00ff41] shadow-[0_0_8px_#00ff41] animate-pulse"></div>
+            <div>
+              <h1 className="text-lg font-bold tracking-tighter text-[#00ff41] flex items-center gap-2"><Activity className="w-5 h-5" /> ILBS-v1</h1>
+              <p className="text-[10px] text-[#64748b] uppercase tracking-[0.2em]">QuantArchitect-Prime | SOTA 2024-2026</p>
+            </div>
           </div>
 
-          <div className="flex flex-col">
-            <span className="text-[10px] text-[#64748b] uppercase">Цена (BTCUSDT)</span>
-            <span className="text-sm font-bold text-[#e0e0e0]">${currentPriceStr}</span>
+          <div className="flex gap-8 text-right items-center">
+            <div className="flex bg-[#1a2233]/40 p-1 rounded gap-1 mr-2 border border-[#1a2233]">
+              <button onClick={() => { setView('dashboard'); setChartFullscreen(false); }} className={`px-3 py-1 rounded text-[10px] font-bold tracking-wider transition-colors hover:text-[#00ff41] ${view === 'dashboard' ? 'bg-[#0a0f1d] text-[#e0e0e0] border border-[#1a2233]' : 'text-[#64748b] border border-transparent'}`}>
+                <LayoutDashboard className="w-3 h-3 inline mr-1 -mt-0.5"/> ДАШБОРД
+              </button>
+              <button onClick={() => setView('chart')} className={`px-3 py-1 rounded text-[10px] font-bold tracking-wider transition-colors hover:text-[#38bdf8] ${view === 'chart' ? 'bg-[#0a0f1d] text-[#e0e0e0] border border-[#1a2233]' : 'text-[#64748b] border border-transparent'}`}>
+                <BarChart2 className="w-3 h-3 inline mr-1 -mt-0.5"/> ГРАФИК ЛИКВИДНОСТИ
+              </button>
+              <button onClick={() => { setView('portfolio'); setChartFullscreen(false); }} className={`px-3 py-1 rounded text-[10px] font-bold tracking-wider transition-colors hover:text-[#f59e0b] ${view === 'portfolio' ? 'bg-[#0a0f1d] text-[#e0e0e0] border border-[#1a2233]' : 'text-[#64748b] border border-transparent'}`}>
+                <Briefcase className="w-3 h-3 inline mr-1 -mt-0.5"/> СДЕЛКИ И PNL
+              </button>
+            </div>
+
+            <div className="flex flex-col">
+              <span className="text-[10px] text-[#64748b] uppercase">Цена (BTCUSDT)</span>
+              <span className="text-sm font-bold text-[#e0e0e0]">${currentPriceStr}</span>
+            </div>
+            <div className="flex flex-col">
+              <span className="text-[10px] text-[#64748b] uppercase">Задержка (Hot Path)</span>
+              <span className="text-sm font-bold text-[#38bdf8]">{latency.toFixed(2)}ms <span className="text-[10px] opacity-50 text-[#38bdf8]">E2E</span></span>
+            </div>
+            <div className="flex flex-col">
+              <span className="text-[10px] text-[#64748b] uppercase">Статус Системы</span>
+              <span className={`text-sm font-bold ${halted ? 'text-[#ef4444]' : 'text-emerald-400'}`}>{halted ? 'HALTED' : state}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button 
+                onClick={toggleHalt}
+                className={`px-4 py-1.5 text-[10px] uppercase font-bold rounded border transition-all select-none flex items-center gap-1
+                 ${halted 
+                   ? 'bg-[#00ff41] text-[#0a0f1d] border-[#00ff41] hover:bg-[#00dd35] active:scale-95 shadow-[0_0_10px_rgba(0,255,65,0.4)]' 
+                   : 'bg-[#ef4444]/15 text-[#ef4444] border-[#ef4444]/30 hover:bg-[#ef4444]/25 active:scale-95'}
+                `}
+                title={halted ? "Запустить торгового робота" : "Остановить торгового робота"}
+              >
+                 {halted ? <Play className="w-3 h-3 fill-current" /> : <Pause className="w-3 h-3 fill-current" />}
+                 {halted ? 'СТАРТ' : 'СТОП'}
+              </button>
+              <button 
+                onClick={toggleHalt}
+                className={`px-3 py-1.5 text-[10px] font-bold rounded border transition-all select-none
+                 ${halted 
+                   ? 'bg-[#ef4444]/10 text-[#64748b] border-[#1a2233] cursor-not-allowed opacity-40' 
+                   : 'bg-transparent text-[#ef4444] border-[#ef4444]/40 hover:bg-[#ef4444]/15 active:scale-95'}
+                `}
+                disabled={halted}
+                title="Экстренная остановка всех процессов робота"
+              >
+                 KILL SWITCH
+              </button>
+            </div>
           </div>
-          <div className="flex flex-col">
-            <span className="text-[10px] text-[#64748b] uppercase">Задержка (Hot Path)</span>
-            <span className="text-sm font-bold text-[#38bdf8]">{latency.toFixed(2)}ms <span className="text-[10px] opacity-50 text-[#38bdf8]">E2E</span></span>
-          </div>
-          <div className="flex flex-col">
-            <span className="text-[10px] text-[#64748b] uppercase">Статус Системы</span>
-            <span className={`text-sm font-bold ${halted ? 'text-[#ef4444]' : 'text-emerald-400'}`}>{halted ? 'HALTED' : state}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <button 
-              onClick={toggleHalt}
-              className={`px-4 py-1.5 text-[10px] uppercase font-bold rounded border transition-all select-none flex items-center gap-1
-               ${halted 
-                 ? 'bg-[#00ff41] text-[#0a0f1d] border-[#00ff41] hover:bg-[#00dd35] active:scale-95 shadow-[0_0_10px_rgba(0,255,65,0.4)]' 
-                 : 'bg-[#ef4444]/15 text-[#ef4444] border-[#ef4444]/30 hover:bg-[#ef4444]/25 active:scale-95'}
-              `}
-              title={halted ? "Запустить торгового робота" : "Остановить торгового робота"}
-            >
-               {halted ? <Play className="w-3 h-3 fill-current" /> : <Pause className="w-3 h-3 fill-current" />}
-               {halted ? 'СТАРТ' : 'СТОП'}
-            </button>
-            <button 
-              onClick={toggleHalt}
-              className={`px-3 py-1.5 text-[10px] font-bold rounded border transition-all select-none
-               ${halted 
-                 ? 'bg-[#ef4444]/10 text-[#64748b] border-[#1a2233] cursor-not-allowed opacity-40' 
-                 : 'bg-transparent text-[#ef4444] border-[#ef4444]/40 hover:bg-[#ef4444]/15 active:scale-95'}
-              `}
-              disabled={halted}
-              title="Экстренная остановка всех процессов робота"
-            >
-               KILL SWITCH
-            </button>
-          </div>
-        </div>
-      </header>
+        </header>
+      )}
 
       {/* Main Layout Area */}
-      <div className="flex-1 flex min-h-0 container mx-auto max-w-[1400px]">
+      <div className={`flex-1 flex min-h-0 w-full ${chartFullscreen ? 'max-w-none p-0 m-0' : 'container mx-auto max-w-[1400px]'}`}>
         
         {/* Left Sidebar: Controls & Settings */}
-        <SettingsPanel config={config} onChange={updateConfig} />
+        {!chartFullscreen && <SettingsPanel config={config} onChange={updateConfig} />}
 
         {/* Center Area: Context Switching */}
-        <main className="flex-1 p-4 flex flex-col min-w-0 gap-4 z-10 overflow-y-auto">
+        <main className={`flex-1 flex flex-col min-w-0 gap-4 z-10 overflow-y-auto ${chartFullscreen ? 'p-0' : 'p-4'}`}>
            
            {view === 'dashboard' && (
              <>
@@ -191,6 +194,8 @@ export default function App() {
                zones={zones} 
                timeframe={timeframe} 
                setTimeframe={setTimeframe} 
+               isFullscreen={chartFullscreen}
+               onFullscreenChange={setChartFullscreen}
              />
            )}
 
@@ -212,30 +217,32 @@ export default function App() {
         </main>
 
         {/* Right Sidebar: Execution log */}
-        <SignalLog signals={signals} />
+        {!chartFullscreen && <SignalLog signals={signals} />}
 
       </div>
 
-      <footer className="mt-auto h-8 px-4 flex items-center justify-between border-t border-[#1a2233] text-[10px] text-[#64748b] bg-[#050608] shrink-0 z-10 relative">
-        <div className="flex gap-4 items-center">
-          <span>SYSTEM_UPTIME: 142:22:04</span>
-          <span>DB_SYNC: DUCKDB [LOCAL]</span>
-          <span>EXCHANGE: BINANCE [FEED: {wsStatus}]</span>
-          <button 
-            onClick={() => setShowLogs(!showLogs)} 
-            className={`flex items-center gap-1 px-2 py-0.5 rounded border text-[9px] transition-all font-bold ${
-              showLogs ? 'bg-[#ef4444]/20 border-[#ef4444] text-[#ef4444]' : 'bg-transparent border-[#1a2233] text-[#e0e0e0] hover:text-[#00ff41]'
-            }`}
-          >
-            <Terminal className="w-2.5 h-2.5" /> СЕРВЕРНЫЕ ЛОГИ ({logs.length})
-          </button>
-        </div>
-        <div className="flex gap-4 items-center">
-          <span className="text-[#00ff41]">● ENGINE_READY</span>
-          <span className="text-[#38bdf8]">● NETWORK_OPTIMIZED</span>
-          <span className="bg-white/10 px-2 rounded text-white">v1.0.0-PROD</span>
-        </div>
-      </footer>
+      {!chartFullscreen && (
+        <footer className="mt-auto h-8 px-4 flex items-center justify-between border-t border-[#1a2233] text-[10px] text-[#64748b] bg-[#050608] shrink-0 z-10 relative">
+          <div className="flex gap-4 items-center">
+            <span>SYSTEM_UPTIME: 142:22:04</span>
+            <span>DB_SYNC: DUCKDB [LOCAL]</span>
+            <span>EXCHANGE: BINANCE [FEED: {wsStatus}]</span>
+            <button 
+              onClick={() => setShowLogs(!showLogs)} 
+              className={`flex items-center gap-1 px-2 py-0.5 rounded border text-[9px] transition-all font-bold ${
+                showLogs ? 'bg-[#ef4444]/20 border-[#ef4444] text-[#ef4444]' : 'bg-transparent border-[#1a2233] text-[#e0e0e0] hover:text-[#00ff41]'
+              }`}
+            >
+              <Terminal className="w-2.5 h-2.5" /> СЕРВЕРНЫЕ ЛОГИ ({logs.length})
+            </button>
+          </div>
+          <div className="flex gap-4 items-center">
+            <span className="text-[#00ff41]">● ENGINE_READY</span>
+            <span className="text-[#38bdf8]">● NETWORK_OPTIMIZED</span>
+            <span className="bg-white/10 px-2 rounded text-white">v1.0.0-PROD</span>
+          </div>
+        </footer>
+      )}
 
       {/* Real-time Backend Diagnostic Logs Drawer */}
       {showLogs && (

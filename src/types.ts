@@ -21,6 +21,7 @@ export interface LiquidityZone {
   volumeScore?: number;
   cvdScore?: number;
   oiScore?: number;
+  touchesCount?: number;
 }
 
 export interface TradePosition {

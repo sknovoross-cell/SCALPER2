@@ -20,10 +20,39 @@ interface MarketChartProps {
   timeframe: string;
   setTimeframe: (tf: string) => void;
   trades?: HistorisedTrade[];
+  isFullscreen?: boolean;
+  onFullscreenChange?: (isFullscreen: boolean) => void;
 }
 
-export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] }: MarketChartProps) {
-  const [isFullscreen, setIsFullscreen] = useState(false);
+export function MarketChart({ 
+  data, 
+  zones, 
+  timeframe, 
+  setTimeframe, 
+  trades = [],
+  isFullscreen: controlledIsFullscreen,
+  onFullscreenChange
+}: MarketChartProps) {
+  const [localIsFullscreen, setLocalIsFullscreen] = useState(false);
+  
+  const isFullscreen = controlledIsFullscreen !== undefined ? controlledIsFullscreen : localIsFullscreen;
+  
+  const setIsFullscreen = (val: boolean | ((prev: boolean) => boolean)) => {
+    if (onFullscreenChange) {
+      if (typeof val === 'function') {
+        const next = val(isFullscreen);
+        onFullscreenChange(next);
+      } else {
+        onFullscreenChange(val);
+      }
+    } else {
+      if (typeof val === 'function') {
+        setLocalIsFullscreen(val);
+      } else {
+        setLocalIsFullscreen(val);
+      }
+    }
+  };
   const [chartType, setChartType] = useState<'area' | 'line'>('area');
   const [gridEnabled, setGridEnabled] = useState(true);
   const [showZones, setShowZones] = useState(true);
@@ -104,11 +133,29 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
   };
   const activeWeight = tfWeights[timeframe] || 1;
 
-  const relevantZones = zones.filter(z => {
+  // First filter by weight
+  const minActiveFilteredZones = zones.filter(z => {
     const zoneTf = z.timeframe || '1d';
     const zoneWeight = tfWeights[zoneTf] || 6;
     return zoneWeight >= activeWeight;
   });
+
+  // If we are looking at a lower timeframe, prune 1m and 5m zones to show only the most immediate support/resistance relative to currentPrice
+  const m1Zones = minActiveFilteredZones.filter(z => z.timeframe === '1m');
+  const m5Zones = minActiveFilteredZones.filter(z => z.timeframe === '5m');
+  const seniorZones = minActiveFilteredZones.filter(z => z.timeframe !== '1m' && z.timeframe !== '5m');
+
+  // Prune 1m zones: keep only the closest 3 below and 3 above the current price to prevent visual clutter
+  const m1Below = m1Zones.filter(z => z.price < currentPrice).sort((a, b) => b.price - a.price).slice(0, 3);
+  const m1Above = m1Zones.filter(z => z.price >= currentPrice).sort((a, b) => a.price - b.price).slice(0, 3);
+  const prunedM1 = [...m1Below, ...m1Above];
+
+  // Prune 5m zones: keep only the closest 4 below and 4 above
+  const m5Below = m5Zones.filter(z => z.price < currentPrice).sort((a, b) => b.price - a.price).slice(0, 4);
+  const m5Above = m5Zones.filter(z => z.price >= currentPrice).sort((a, b) => a.price - b.price).slice(0, 4);
+  const prunedM5 = [...m5Below, ...m5Above];
+
+  const relevantZones = [...seniorZones, ...prunedM1, ...prunedM5];
 
   // Filter zones to current viewable scope and stagger overlapping labels
   const visibleZones = relevantZones.filter(z => z.price >= minDomain && z.price <= maxDomain);
@@ -419,6 +466,76 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
               Обновлено: {hoveredZone.zone.updatedAt || 'н/д'}
             </span>
           </div>
+
+          {/* Dynamic Validity Score Block */}
+          {(() => {
+            let score = 40; // Base score
+            const zone = hoveredZone.zone;
+            
+            // Timeframe contribution
+            if (zone.timeframe === '1d') score += 30;
+            else if (zone.timeframe === '4h') score += 25;
+            else if (zone.timeframe === '1h') score += 15;
+            else if (zone.timeframe === '15m') score += 10;
+            else if (zone.timeframe === '5m') score += 5;
+
+            // Structural strength contribution
+            if (zone.levelStrength === 'HTF') {
+              score += 25;
+            } else {
+              score += 10;
+            }
+
+            // Volume indicator presence (if volume is above average)
+            if (zone.volumeScore && zone.volumeScore > 1000) {
+              score += 10;
+            }
+            
+            // Open Interest contribution
+            if (zone.oiScore && Math.abs(zone.oiScore) > 5) {
+              score += 10;
+            }
+
+            const finalScore = Math.min(100, Math.max(30, score));
+            
+            let colorClass = "text-[#f43f5e]";
+            let bgClass = "bg-[#f43f5e]/5 border-[#f43f5e]/15";
+            let barColor = "bg-[#f43f5e]";
+            let statusText = "ЛОКАЛЬНЫЙ ТЕСТ (КРАТКОСРОЧНЫЙ)";
+            
+            if (finalScore >= 80) {
+              colorClass = "text-[#00ff41] drop-shadow-[0_0_6px_rgba(0,255,65,0.4)]";
+              bgClass = "bg-[#00ff41]/5 border-[#00ff41]/20";
+              barColor = "bg-[#00ff41] shadow-[0_0_8px_rgba(0,255,65,0.6)]";
+              statusText = "АБСОЛЮТНАЯ ВАЛИДНОСТЬ (HTF)";
+            } else if (finalScore >= 55) {
+              colorClass = "text-[#fbbf24] drop-shadow-[0_0_5px_rgba(251,191,36,0.3)]";
+              bgClass = "bg-[#fbbf24]/5 border-[#fbbf24]/15";
+              barColor = "bg-[#fbbf24]";
+              statusText = "ПОДТВЕРЖДЕН КЛАСТЕРОМ VAP";
+            }
+            
+            return (
+              <div className={`p-2 rounded border ${bgClass} mb-2.5 flex flex-col gap-1.5`}>
+                <div className="flex justify-between items-center">
+                  <span className="text-[8px] uppercase tracking-wider text-gray-400 font-bold font-sans">Оценка уровня:</span>
+                  <span className={`text-[10px] font-extrabold font-mono ${colorClass}`}>{finalScore}%</span>
+                </div>
+                
+                {/* Visual Progress Bar */}
+                <div className="w-full bg-[#111827] h-1.5 rounded-full overflow-hidden border border-gray-800">
+                  <div className={`h-full rounded-full transition-all duration-500 ${barColor}`} style={{ width: `${finalScore}%` }}></div>
+                </div>
+
+                <div className="flex items-center gap-1">
+                  <TrendingUp className={`w-3 h-3 ${colorClass}`} />
+                  <span className={`text-[8px] uppercase tracking-normal font-sans font-extrabold ${colorClass}`}>
+                    {statusText}
+                  </span>
+                </div>
+              </div>
+            );
+          })()}
 
           {/* Criteria List */}
           <div className="space-y-1.5">

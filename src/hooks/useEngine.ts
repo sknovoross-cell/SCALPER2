@@ -122,7 +122,7 @@ export function useEngine() {
   const zonesRef = useRef<LiquidityZone[]>([]);
   zonesRef.current = zones;
 
-  const [halted, setHalted] = useState(false);
+  const [halted, setHalted] = useState(true);
   const [latency, setLatency] = useState(0);
   
   // Real-time trading & PnL Engine state
@@ -369,9 +369,11 @@ export function useEngine() {
         volumeScore?: number;
         cvdScore?: number;
         oiScore?: number;
+        promotedStr?: string;
+        touchesCount?: number;
       }[] = [];
 
-      // A helper to extract pivot highs / lows (local 3-bar extremes) confirmed with Volume, CVD, and OI
+      // A helper to extract pivot highs / lows confirmed with Volume, CVD, and OI
       function extractPivots(
         candles: any[] | null, 
         tfLabel: string, 
@@ -382,20 +384,31 @@ export function useEngine() {
       ) {
         if (!candles || candles.length < 15) return;
         const len = candles.length;
-        const strength = scaleWeight >= 3 ? 'HTF' : 'LTF';
-        for (let i = 3; i < len - 3; i++) {
-          const prev3 = candles.slice(i - 3, i);
-          const next3 = candles.slice(i + 1, i + 4);
+        
+        // Dynamic window size: 2-bar wings for ultra-short 1m micro-signals, 3-bar for senior timeframes
+        const windowSize = tfName === '1m' ? 2 : 3;
+
+        // Multipliers to convert candles back to approximate chronological minutes
+        const tfMultiplier = tfName === '1m' ? 1
+                           : tfName === '5m' ? 5
+                           : tfName === '15m' ? 15
+                           : tfName === '1h' ? 60
+                           : tfName === '4h' ? 240
+                           : 1440;
+
+        for (let i = windowSize; i < len - windowSize; i++) {
+          const prev = candles.slice(i - windowSize, i);
+          const next = candles.slice(i + 1, i + windowSize + 1);
           const curr = candles[i];
           
           const currHigh = curr.high;
           const currLow = curr.low;
 
-          const isPivotHigh = prev3.every(p => currHigh >= p.high) && next3.every(n => currHigh > n.high);
-          const isPivotLow = prev3.every(p => currLow <= p.low) && next3.every(n => currLow < n.low);
+          const isPivotHigh = prev.every(p => currHigh >= p.high) && next.every(n => currHigh > n.high);
+          const isPivotLow = prev.every(p => currLow <= p.low) && next.every(n => currLow < n.low);
 
-          // Calculate volume, CVD, and OI around pivot bar (3 context bars: i-1, i, i+1)
-          const pivotCandles = candles.slice(i - 1, i + 2);
+          // Calculate volume, CVD, and OI around pivot bar
+          const pivotCandles = candles.slice(Math.max(0, i - 1), Math.min(len, i + 2));
           const totalVolume = pivotCandles.reduce((sum, c) => sum + (c.volume || 0), 0);
           const totalCvd = pivotCandles.reduce((sum, c) => sum + (c.cvd || 0), 0);
           
@@ -403,31 +416,161 @@ export function useEngine() {
           const currentOI = candles[i + 1]?.oi || candles[i]?.oi || 0;
           const oiChange = currentOI - previousOI;
 
+          // AGE-BASED PROMOTION LOGIC:
+          // A level that survived for multiple minutes gets graded up to a senior timeframe designation
+          const ageInMinutes = (len - 1 - i) * tfMultiplier;
+          let finalTfName = tfName;
+          let finalTfLabel = tfLabel;
+          let finalScaleWeight = scaleWeight;
+          let finalColorHigh = baseColorHigh;
+          let finalColorLow = baseColorLow;
+          let promotedStr = "";
+
+          if (tfName === '1m') {
+            if (ageInMinutes >= 15) {
+              finalTfName = '15m';
+              finalTfLabel = 'M15';
+              finalScaleWeight = 2;
+              finalColorHigh = "#84cc16"; // lime
+              finalColorLow = "#a855f7"; // purple
+              promotedStr = `Амортизация времени: уровень устоял ${ageInMinutes} мин и прогрессировал с M1 до M15.`;
+            } else if (ageInMinutes >= 5) {
+              finalTfName = '5m';
+              finalTfLabel = 'M5';
+              finalScaleWeight = 1;
+              finalColorHigh = "#fb7185"; // rose
+              finalColorLow = "#38bdf8"; // sky
+              promotedStr = `Амортизация времени: уровень устоял ${ageInMinutes} мин и прогрессировал с M1 до M5.`;
+            }
+          } else if (tfName === '5m') {
+            if (ageInMinutes >= 15) {
+              finalTfName = '15m';
+              finalTfLabel = 'M15';
+              finalScaleWeight = 2;
+              finalColorHigh = "#84cc16"; // lime
+              finalColorLow = "#a855f7"; // purple
+              promotedStr = `Амортизация времени: уровень устоял ${ageInMinutes} мин и прогрессировал с M5 до M15.`;
+            }
+          } else if (tfName === '15m') {
+            if (ageInMinutes >= 60) {
+              finalTfName = '1h';
+              finalTfLabel = 'H1';
+              finalScaleWeight = 3;
+              finalColorHigh = "#d946ef"; // fuchsia
+              finalColorLow = "#06b6d4"; // cyan
+              promotedStr = `Амортизация времени: уровень устоял ${ageInMinutes} мин и прогрессировал с M15 до H1.`;
+            }
+          }
+
+          const strength = finalScaleWeight >= 3 ? 'HTF' : 'LTF';
+
           if (isPivotHigh) {
-            candidates.push({ 
-              price: currHigh, 
-              type: `${tfLabel} RESIST`, 
-              color: baseColorHigh, 
-              scale: scaleWeight,
-              levelStrength: strength,
-              timeframe: tfName,
-              volumeScore: totalVolume,
-              cvdScore: totalCvd,
-              oiScore: oiChange
-            });
+            // Filter out junior timeframe levels (1m, 5m, 15m) if they have been broken by subsequent candle highs
+            let isBroken = false;
+            if (tfName === '1m' || tfName === '5m' || tfName === '15m') {
+              for (let j = i + 1; j < len; j++) {
+                if (candles[j].high > currHigh) {
+                  isBroken = true;
+                  break;
+                }
+              }
+            }
+
+            if (!isBroken) {
+              // Calculate multi-touch support & count approaches
+              let touchesCount = 1;
+              let accumVolume = totalVolume;
+              let accumCvd = Math.abs(totalCvd);
+              let accumOi = Math.abs(oiChange);
+              
+              const touchThreshold = currHigh * 0.0008; // 0.08% of price
+              for (let j = i + 1; j < len; j++) {
+                const checkCandle = candles[j];
+                // If subsequent candle gets close to level
+                if (Math.abs(checkCandle.high - currHigh) <= touchThreshold) {
+                  touchesCount++;
+                  accumVolume += (checkCandle.volume || 0);
+                  accumCvd += Math.abs(checkCandle.cvd || 0);
+                  accumOi += Math.abs((checkCandle.oi || 0) - (candles[j - 1]?.oi || checkCandle.oi || 0));
+                }
+              }
+
+              // Status Boosting: if level maintains multiple touches/touches count, elevate scale and strength
+              let finalLevelStrength: 'HTF' | 'LTF' = strength;
+              let finalScaleWeightAdjusted = finalScaleWeight;
+              if (touchesCount >= 3) {
+                finalLevelStrength = 'HTF';
+                finalScaleWeightAdjusted += 1.0;
+              }
+
+              candidates.push({ 
+                price: currHigh, 
+                type: `${finalTfLabel} RESIST`, 
+                color: finalColorHigh, 
+                scale: finalScaleWeightAdjusted,
+                levelStrength: finalLevelStrength,
+                timeframe: finalTfName,
+                volumeScore: accumVolume,
+                cvdScore: accumCvd,
+                oiScore: accumOi,
+                touchesCount,
+                promotedStr
+              });
+            }
           }
           if (isPivotLow) {
-            candidates.push({ 
-              price: currLow, 
-              type: `${tfLabel} SUPPORT`, 
-              color: baseColorLow, 
-              scale: scaleWeight,
-              levelStrength: strength,
-              timeframe: tfName,
-              volumeScore: totalVolume,
-              cvdScore: totalCvd,
-              oiScore: oiChange
-            });
+            // Filter out junior timeframe levels (1m, 5m, 15m) if they have been broken by subsequent candle lows
+            let isBroken = false;
+            if (tfName === '1m' || tfName === '5m' || tfName === '15m') {
+              for (let j = i + 1; j < len; j++) {
+                if (candles[j].low < currLow) {
+                  isBroken = true;
+                  break;
+                }
+              }
+            }
+
+            if (!isBroken) {
+              // Calculate multi-touch support & count approaches
+              let touchesCount = 1;
+              let accumVolume = totalVolume;
+              let accumCvd = Math.abs(totalCvd);
+              let accumOi = Math.abs(oiChange);
+              
+              const touchThreshold = currLow * 0.0008; // 0.08% of price
+              for (let j = i + 1; j < len; j++) {
+                const checkCandle = candles[j];
+                // If subsequent candle gets close to level
+                if (Math.abs(checkCandle.low - currLow) <= touchThreshold) {
+                  touchesCount++;
+                  accumVolume += (checkCandle.volume || 0);
+                  accumCvd += Math.abs(checkCandle.cvd || 0);
+                  accumOi += Math.abs((checkCandle.oi || 0) - (candles[j - 1]?.oi || checkCandle.oi || 0));
+                }
+              }
+
+              // Status Boosting: if level maintains multiple touches/touches count, elevate scale and strength
+              let finalLevelStrength: 'HTF' | 'LTF' = strength;
+              let finalScaleWeightAdjusted = finalScaleWeight;
+              if (touchesCount >= 3) {
+                finalLevelStrength = 'HTF';
+                finalScaleWeightAdjusted += 1.0;
+              }
+
+              candidates.push({ 
+                price: currLow, 
+                type: `${finalTfLabel} SUPPORT`, 
+                color: finalColorLow, 
+                scale: finalScaleWeightAdjusted,
+                levelStrength: finalLevelStrength,
+                timeframe: finalTfName,
+                volumeScore: accumVolume,
+                cvdScore: accumCvd,
+                oiScore: accumOi,
+                touchesCount,
+                promotedStr
+              });
+            }
           }
         }
       }
@@ -481,6 +624,7 @@ export function useEngine() {
       extractPivots(parsed1h, "H1", "#d946ef", "#06b6d4", 3, "1h"); // fuchsia / cyan
       extractPivots(parsed15m, "M15", "#84cc16", "#a855f7", 2, "15m"); // lime / purple
       extractPivots(parsed5m, "M5", "#fb7185", "#38bdf8", 1, "5m"); // rose / sky
+      extractPivots(parsed1m, "M1", "#ec4899", "#14b8a6", 0.5, "1m"); // pink / teal
 
       // Sort candidated pivot zones by timeframe scale weight (seniority)
       candidates.sort((a, b) => b.scale - a.scale);
@@ -490,88 +634,146 @@ export function useEngine() {
       candidates.forEach(cand => {
         // Dynamic cluster threshold based on price magnitude & TF seniority.
         // Senior levels have a wider filter (~290 USD), while junior levels support tighter cascades (~50 USD)
-        const clusterThreshold = cand.levelStrength === 'HTF'
+        let clusterThreshold = cand.levelStrength === 'HTF'
           ? Math.max(120, cand.price * 0.0045)
           : Math.max(45, cand.price * 0.0008);
+        
+        // Let M1 timeframe levels sit closer to other levels for maximum detail, but not cluster too tightly to prevent noise
+        if (cand.timeframe === '1m') {
+          clusterThreshold = Math.max(45, cand.price * 0.0007);
+        }
 
-        const tooClose = distinctZones.some(z => Math.abs(z.price - cand.price) < clusterThreshold);
-        if (!tooClose) {
-          const updateTimeStr = new Date().toLocaleTimeString('ru-RU');
-          const isResistance = cand.price >= finalPrice;
-          const tfUpper = (cand.timeframe || '1m').toUpperCase();
-          let finalType = cand.type;
-          let finalColor = cand.color;
-          const criteria: string[] = [];
+        // --- NEW RULE: JUNIOR PROXIMITY SUPPRESSION TO SENIOR LEVELS ---
+        // If this candidate is a junior level (1m or 5m), check if there is any senior level (15m, 1h, 4h, 1d) that is very close.
+        if (cand.timeframe === '1m' || cand.timeframe === '5m') {
+          const hasNearbySenior = distinctZones.some(z => {
+            const isSenior = z.timeframe !== '1m' && z.timeframe !== '5m';
+            if (!isSenior) return false;
+            // Proximity limit: e.g., 0.25% of price (~$160 for BTC).
+            // If the junior level is close, we suppress it because the senior level is much more valid!
+            const proximityLimit = Math.max(160, cand.price * 0.0025);
+            return Math.abs(z.price - cand.price) < proximityLimit;
+          });
+          if (hasNearbySenior) {
+            // Suppress the level!
+            return; 
+          }
+        }
+        // ---------------------------------------------------------------
 
+        const matchingZone = distinctZones.find(z => Math.abs(z.price - cand.price) < clusterThreshold);
+        if (matchingZone) {
+          // Merge validating signs of strength!
+          matchingZone.volumeScore = (matchingZone.volumeScore || 0) + (cand.volumeScore || 0);
+          matchingZone.cvdScore = (matchingZone.cvdScore || 0) + (cand.cvdScore || 0);
+          matchingZone.oiScore = (matchingZone.oiScore || 0) + (cand.oiScore || 0);
+          matchingZone.touchesCount = (matchingZone.touchesCount || 1) + (cand.touchesCount || 1);
+          
+          if (cand.levelStrength === 'HTF') {
+            matchingZone.levelStrength = 'HTF';
+          }
+          
+          if (!matchingZone.validationCriteria) {
+            matchingZone.validationCriteria = [];
+          }
           const formattedVol = cand.volumeScore ? cand.volumeScore.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) : '0';
           const formattedCvd = cand.cvdScore ? cand.cvdScore.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) : '0';
-          const formattedOi = cand.oiScore ? cand.oiScore.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) : '0';
+          
+          matchingZone.validationCriteria.push(
+            `Сноска слияния: близкий уровень ${cand.timeframe?.toUpperCase()} (цена ${cand.price.toFixed(1)}) скооперирован. ` +
+            `Результирующий приток сил: объем +${formattedVol} BTC, CVD +${formattedCvd} BTC. ` +
+            `Итого касаний/слияний уровня: ${matchingZone.touchesCount}.`
+          );
+          return;
+        }
 
-          if (cand.timeframe === '1d') {
-            finalType = isResistance ? "1D SWING RESIST" : "1D SWING SUPPORT";
-            finalColor = isResistance ? "#f43f5e" : "#3b82f6";
-            criteria.push("Крайние точки диапазона (Swing): Абсолютный экстремум за 30 дней.");
-            criteria.push(`Горизонтальный объем уровня: ${formattedVol} BTC.`);
-            criteria.push(isResistance 
-              ? `Поглощение на хаях: Лимитные ордера продавцов остановили покупателей (Delta: ${formattedCvd} BTC).`
-              : `Поглощение на лоях: Лимитный спрос поглотил агрессивные продажи (Delta: ${formattedCvd} BTC).`
-            );
-            if (cand.oiScore && cand.oiScore > 0) {
-              criteria.push(`Приток позиций на уровне (OI): +${formattedOi} BTC.`);
-            }
-          } else {
-            finalType = isResistance ? `${tfUpper} RESIST` : `${tfUpper} SUPPORT`;
-            if (cand.timeframe === '4h') {
-              finalColor = isResistance ? "#f59e0b" : "#10b981";
-            } else if (cand.timeframe === '1h') {
-              finalColor = isResistance ? "#d946ef" : "#06b6d4";
-            } else if (cand.timeframe === '15m') {
-              finalColor = isResistance ? "#84cc16" : "#a855f7";
-            } else { // 5m
-              finalColor = isResistance ? "#fb7185" : "#38bdf8";
-            }
+        const updateTimeStr = new Date().toLocaleTimeString('ru-RU');
+        const isResistance = cand.price >= finalPrice;
+        const tfUpper = (cand.timeframe || '1m').toUpperCase();
+        let finalType = cand.type;
+        let finalColor = cand.color;
+        const criteria: string[] = [];
 
-            if (cand.levelStrength === 'HTF') {
-              criteria.push(`Старший разворот ${tfUpper}: Подтвержденная 3-барная структура.`);
-              criteria.push(`Аккумуляция объема в узле: ${formattedVol} BTC.`);
-              if (isResistance) {
-                criteria.push(`Ограничение спроса (CVD): Рост покупок выдохся перед лимитами продавцов (Delta: ${formattedCvd} BTC).`);
-              } else {
-                criteria.push(`Удержание продаж (CVD): Рыночное давление увяхло в плотной поддержке (Delta: ${formattedCvd} BTC).`);
-              }
-              if (cand.oiScore && cand.oiScore > 0) {
-                criteria.push(`Набор встречных позиций (OI): +${formattedOi} BTC в стакане.`);
-              }
-            } else {
-              criteria.push(`Разворотный микро-свинг ${tfUpper}: Локальная кульминация.`);
-              criteria.push(`Скальп-объем: Проторговано ${formattedVol} BTC.`);
-              criteria.push(isResistance 
-                ? `Всплеск ложных покупок (Delta: ${formattedCvd} BTC) прерван лимитным барьером.`
-                : `Капитуляция ритейл-продавцов (Delta: ${formattedCvd} BTC) выкуплена по рынку.`
-              );
-              if (cand.oiScore && Math.abs(cand.oiScore) > 10) {
-                criteria.push(`Изменение OI: ${cand.oiScore > 0 ? '+' : ''}${formattedOi} BTC.`);
-              }
-            }
+        const formattedVol = cand.volumeScore ? cand.volumeScore.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) : '0';
+        const formattedCvd = cand.cvdScore ? cand.cvdScore.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) : '0';
+        const formattedOi = cand.oiScore ? cand.oiScore.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) : '0';
+
+        if (cand.promotedStr) {
+          criteria.push(cand.promotedStr);
+        }
+
+        if (cand.touchesCount && cand.touchesCount > 1) {
+          criteria.push(`Мульти-касание: уровень протестирован повторно (всего касаний: ${cand.touchesCount}). Объемы подтверждены.`);
+        }
+
+        if (cand.timeframe === '1d') {
+          finalType = isResistance ? "1D SWING RESIST" : "1D SWING SUPPORT";
+          finalColor = isResistance ? "#f43f5e" : "#3b82f6";
+          criteria.push("Крайние точки диапазона (Swing): Абсолютный экстремум за 30 дней.");
+          criteria.push(`Горизонтальный объем уровня: ${formattedVol} BTC.`);
+          criteria.push(isResistance 
+            ? `Поглощение на хаях: Лимитные ордера продавцов остановили покупателей (Delta: ${formattedCvd} BTC).`
+            : `Поглощение на лоях: Лимитный спрос поглотил агрессивные продажи (Delta: ${formattedCvd} BTC).`
+          );
+          if (cand.oiScore && cand.oiScore > 0) {
+            criteria.push(`Приток позиций на уровне (OI): +${formattedOi} BTC.`);
+          }
+        } else {
+          finalType = isResistance ? `${tfUpper} RESIST` : `${tfUpper} SUPPORT`;
+          if (cand.timeframe === '4h') {
+            finalColor = isResistance ? "#f59e0b" : "#10b981";
+          } else if (cand.timeframe === '1h') {
+            finalColor = isResistance ? "#d946ef" : "#06b6d4";
+          } else if (cand.timeframe === '15m') {
+            finalColor = isResistance ? "#84cc16" : "#a855f7";
+          } else if (cand.timeframe === '5m') {
+            finalColor = isResistance ? "#fb7185" : "#38bdf8";
+          } else { // 1m
+            finalColor = isResistance ? "#ec4899" : "#14b8a6";
           }
 
-          distinctZones.push({
-            price: cand.price,
-            type: finalType,
-            color: finalColor,
-            levelStrength: cand.levelStrength,
-            timeframe: cand.timeframe,
-            updatedAt: updateTimeStr,
-            validationCriteria: criteria,
-            volumeScore: cand.volumeScore,
-            cvdScore: cand.cvdScore,
-            oiScore: cand.oiScore
-          });
+          if (cand.levelStrength === 'HTF') {
+            criteria.push(`Старший разворот ${tfUpper}: Подтвержденная 3-барная структура.`);
+            criteria.push(`Аккумуляция объема в узле: ${formattedVol} BTC.`);
+            if (isResistance) {
+              criteria.push(`Ограничение спроса (CVD): Рост покупок выдохся перед лимитами продавцов (Delta: ${formattedCvd} BTC).`);
+            } else {
+              criteria.push(`Удержание продаж (CVD): Рыночное давление увяхло в плотной поддержке (Delta: ${formattedCvd} BTC).`);
+            }
+            if (cand.oiScore && cand.oiScore > 0) {
+              criteria.push(`Набор встречных позиций (OI): +${formattedOi} BTC в стакане.`);
+            }
+          } else {
+            criteria.push(`Разворотный микро-свинг ${tfUpper}: Локальная кульминация.`);
+            criteria.push(`Скальп-объем: Проторговано ${formattedVol} BTC.`);
+            criteria.push(isResistance 
+              ? `Всплеск ложных покупок (Delta: ${formattedCvd} BTC) прерван лимитным барьером.`
+              : `Капитуляция ритейл-продавцов (Delta: ${formattedCvd} BTC) выкуплена по рынку.`
+            );
+            if (cand.oiScore && Math.abs(cand.oiScore) > 10) {
+              criteria.push(`Изменение OI: ${cand.oiScore > 0 ? '+' : ''}${formattedOi} BTC.`);
+            }
+          }
         }
+
+        distinctZones.push({
+          price: cand.price,
+          type: finalType,
+          color: finalColor,
+          levelStrength: cand.levelStrength,
+          timeframe: cand.timeframe,
+          updatedAt: updateTimeStr,
+          validationCriteria: criteria,
+          volumeScore: cand.volumeScore,
+          cvdScore: cand.cvdScore,
+          oiScore: cand.oiScore,
+          touchesCount: cand.touchesCount || 1
+        });
       });
 
-      // Filter to top 30 most senior levels globally to allow beautiful down-sampling in components
-      setZones(distinctZones.slice(0, 30));
+      // Allow up to 120 zones globally so junior timeframes (1m, 5m) don't get chopped off,
+      // while the components dynamically filter relevant levels depending on the active timeframe
+      setZones(distinctZones.slice(0, 120));
     } catch (e) {
       console.error("Error recalculating zones:", e);
     } finally {
