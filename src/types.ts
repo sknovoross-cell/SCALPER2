@@ -4,6 +4,10 @@ export interface ChartCandle {
   high: number;
   low: number;
   close: number;
+  volume?: number;
+  takerVolume?: number;
+  cvd?: number;
+  oi?: number;
 }
 
 export interface LiquidityZone {
@@ -14,6 +18,9 @@ export interface LiquidityZone {
   timeframe?: string;
   updatedAt?: string;
   validationCriteria?: string[];
+  volumeScore?: number;
+  cvdScore?: number;
+  oiScore?: number;
 }
 
 export interface TradePosition {

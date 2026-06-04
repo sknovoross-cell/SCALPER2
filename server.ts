@@ -241,6 +241,39 @@ app.get("/api/klines", async (req, res) => {
   return res.status(502).json({ error: "Failed to load candle data from all Binance mirrors." });
 });
 
+// Proxy route for historical Open Interest from Binance
+app.get("/api/oi", async (req, res) => {
+  const symbol = req.query.symbol || "BTCUSDT";
+  const period = req.query.period || "5m";
+  const limit = req.query.limit || "100";
+
+  const endpoints = [
+    `https://fapi.binanceapi.com/fapi/v1/openInterestHist?symbol=${symbol}&period=${period}&limit=${limit}`,
+    `https://fapi.binance.me/fapi/v1/openInterestHist?symbol=${symbol}&period=${period}&limit=${limit}`,
+    `https://fapi.binance.cc/fapi/v1/openInterestHist?symbol=${symbol}&period=${period}&limit=${limit}`,
+    `https://fapi.binance.com/fapi/v1/openInterestHist?symbol=${symbol}&period=${period}&limit=${limit}`,
+    `https://fstream.binance.com/fapi/v1/openInterestHist?symbol=${symbol}&period=${period}&limit=${limit}`
+  ];
+
+  for (const url of endpoints) {
+    try {
+      console.log(`[Server] Fetching historical Open Interest from Binance API: ${url}`);
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} from ${url}`);
+      }
+      const data = await response.json();
+      if (Array.isArray(data) && data.length > 0) {
+        return res.json(data);
+      }
+    } catch (err: any) {
+      console.warn(`[Server] Open Interest fetch failed on ${url}:`, err.message || err);
+    }
+  }
+
+  return res.status(502).json({ error: "Failed to load Open Interest data from all Binance mirrors." });
+});
+
 // SSE endpoint to broadcast binance order book trades live with zero firewall restrictions
 app.get("/api/stream", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");

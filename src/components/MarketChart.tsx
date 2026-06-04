@@ -32,6 +32,7 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
   const [zoomCount, setZoomCount] = useState(100);
   const [yScaleBuffer, setYScaleBuffer] = useState(1.0);
   const [hoveredZone, setHoveredZone] = useState<{ cx: number; cy: number; zone: LiquidityZone } | null>(null);
+  const [showSrDesk, setShowSrDesk] = useState(true);
 
   // Esc key listener for fullscreen exit
   useEffect(() => {
@@ -52,15 +53,37 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
     setShowZones(true);
     setShowPredLiq(true);
     setShowTrades(true);
+    setShowSrDesk(true);
   };
 
   // Slice visible data based on time zoom level
   const visibleData = data.slice(-zoomCount);
 
   // Use slightly larger domain window to see zones above/below current price
-  const dataMin = visibleData.length > 0 ? Math.min(...visibleData.map(d => d.low)) : 64000;
-  const dataMax = visibleData.length > 0 ? Math.max(...visibleData.map(d => d.high)) : 65000;
+  let dataMin = visibleData.length > 0 ? Math.min(...visibleData.map(d => d.low)) : 64000;
+  let dataMax = visibleData.length > 0 ? Math.max(...visibleData.map(d => d.high)) : 65000;
   
+  // Dynamic scale stretching: pull the nearest senior HTF support and resistance levels into the domain
+  // so major HTF liquidity levels are clearly visible even on 1m, 5m or 15m charts!
+  const currentPrice = visibleData.length > 0 ? visibleData[visibleData.length - 1].close : 64250;
+  if (showZones && zones.length > 0) {
+    const seniorZonesAbove = zones.filter(z => z.levelStrength === 'HTF' && z.price > currentPrice);
+    const seniorZonesBelow = zones.filter(z => z.levelStrength === 'HTF' && z.price < currentPrice);
+    
+    if (seniorZonesAbove.length > 0) {
+      const nearestAbove = Math.min(...seniorZonesAbove.map(z => z.price));
+      if (nearestAbove - currentPrice < currentPrice * 0.035) { // within 3.5% range
+        dataMax = Math.max(dataMax, nearestAbove + 35);
+      }
+    }
+    if (seniorZonesBelow.length > 0) {
+      const nearestBelow = Math.max(...seniorZonesBelow.map(z => z.price));
+      if (currentPrice - nearestBelow < currentPrice * 0.035) { // within 3.5% range
+        dataMin = Math.min(dataMin, nearestBelow - 35);
+      }
+    }
+  }
+
   // Dynamic Y-axis margins (padding) based on total scale of the active chart timeframe to prevent
   // lines and labels at the absolute top/bottom extremes from clashing with borders or time axis/ticks.
   const rangeY = dataMax - dataMin;
@@ -291,6 +314,14 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
               {showTrades ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
               <span className="text-[9px] font-bold font-mono">TRADES</span>
             </button>
+            <button
+              onClick={() => setShowSrDesk(!showSrDesk)}
+              className={`px-1.5 py-0.5 rounded transition-all cursor-pointer flex items-center gap-1 border border-transparent ${showSrDesk ? 'text-[#38bdf8] bg-[#38bdf8]/15 border-[#38bdf8]/20' : 'text-gray-400 hover:text-white hover:bg-[#1a2233]/30'}`}
+              title="Панель Деска S/R Ликвидности"
+            >
+              <Activity className="w-3 h-3" />
+              <span className="text-[9px] font-bold font-mono font-sans">S/R DESK</span>
+            </button>
           </div>
 
           {/* Time Zoom Controls */}
@@ -402,8 +433,10 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
         </div>
       )}
 
-      {/* Main Chart Canvas Area */}
-      <div className="flex-1 min-h-[350px]">
+      {/* Main Chart Canvas & S/R Desk combined flex container */}
+      <div className="flex flex-1 min-h-0 w-full gap-4 flex-col lg:flex-row relative">
+        {/* Main Chart Canvas Area */}
+        <div className="flex-1 min-h-[350px] relative">
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={visibleData} margin={{ top: 15, right: 5, left: 15, bottom: 0 }}>
             <defs>
@@ -524,6 +557,95 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
           </AreaChart>
         </ResponsiveContainer>
       </div>
+
+      {/* S/R Desk Real-time Sidebar */}
+      {showSrDesk && (
+        <div className="w-full lg:w-72 bg-[#090d16] border border-[#1a2233] rounded-lg p-3 flex flex-col font-mono shrink-0 max-h-[500px] lg:max-h-none overflow-hidden select-none">
+          <div className="flex justify-between items-center mb-3 pb-2 border-b border-[#1a2233]/40">
+            <span className="text-[11px] font-bold text-[#38bdf8] uppercase tracking-wider flex items-center gap-1.5">
+              <Activity className="w-3.5 h-3.5" />
+              ДЕСК ЛИКВИДНОСТИ (S/R)
+            </span>
+            <button 
+              onClick={() => setShowSrDesk(false)}
+              className="text-gray-400 hover:text-white text-[9px] uppercase font-bold px-1.5 py-0.5 rounded bg-[#1a2233]/30 border border-[#1a2233]/50 hover:bg-[#1a2233]/70 cursor-pointer"
+            >
+              Скрыть
+            </button>
+          </div>
+
+          {/* List of active levels mapped with CVD and OI volume scores */}
+          <div className="space-y-2 flex-1 overflow-y-auto pr-1">
+            {zones.length === 0 ? (
+              <div className="text-gray-500 text-xs text-center py-10">Загрузка сеток ликвидности...</div>
+            ) : (
+              [...zones]
+                .sort((a, b) => {
+                  const tfWeights: { [key: string]: number } = { '1d': 6, '4h': 5, '1h': 4, '15m': 3, '5m': 2, '1m': 1 };
+                  return (tfWeights[b.timeframe || '1d'] || 0) - (tfWeights[a.timeframe || '1d'] || 0);
+                })
+                .map((z, idx) => {
+                  const isResist = z.price >= currentPrice;
+                  const isHTF = z.levelStrength === 'HTF';
+                  
+                  return (
+                    <div 
+                      key={idx}
+                      onClick={() => {
+                        // Interactive focus trigger: temporarily stretch domain to highlight this row
+                        setYScaleBuffer(Math.abs(z.price - currentPrice) / (currentPrice * 0.05) + 0.3);
+                      }}
+                      className={`p-2 rounded border transition-all cursor-pointer hover:bg-[#111827]/75 hover:border-gray-500/30 flex flex-col gap-1.5 ${
+                        isResist ? 'bg-[#f43f5e]/5 border-[#f43f5e]/10' : 'bg-[#10b981]/5 border-[#10b981]/10'
+                      }`}
+                    >
+                      <div className="flex justify-between items-center">
+                        <div className="flex items-center gap-1.5">
+                          <span className="w-2 h-2 rounded-full animate-pulse shrink-0" style={{ backgroundColor: z.color }}></span>
+                          <span className="text-[10px] font-bold text-gray-200">
+                            {(z.timeframe || '1m').toUpperCase()} {isResist ? 'СОПРОТИВЛЕНИЕ' : 'ПОДДЕРЖКА'}
+                          </span>
+                        </div>
+                        {isHTF && (
+                          <span className="text-[8px] px-1 font-sans rounded bg-[#38bdf8]/10 text-[#38bdf8] border border-[#38bdf8]/20 tracking-wider">HTF</span>
+                        )}
+                      </div>
+
+                      <div className="flex justify-between items-baseline">
+                        <span className="text-xs font-bold text-gray-100 font-mono">
+                          ${z.price.toLocaleString('ru-RU', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}
+                        </span>
+                        <span className="text-[9px] text-[#64748b] font-sans">
+                          {Math.abs(z.price - currentPrice) < 150 ? '📍 У цены' : `~${Math.round(Math.abs(z.price - currentPrice))} USD`}
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-3 gap-1 pt-1.5 text-[8px] uppercase tracking-normal border-t border-[#1a2233]/40 text-gray-400 font-sans font-medium">
+                        <div>
+                          <span className="text-[#64748b] text-[8px]">Vol (BTC):</span>
+                          <div className="text-gray-300 font-bold mt-0.5">{(z.volumeScore || 0).toLocaleString('ru-RU', { maximumFractionDigits: 0 })}</div>
+                        </div>
+                        <div>
+                          <span className="text-[#64748b] text-[8px]">Delta:</span>
+                          <div className={`font-bold mt-0.5 ${z.cvdScore && z.cvdScore > 0 ? 'text-[#10b981]' : 'text-[#f43f5e]'}`}>
+                            {z.cvdScore && z.cvdScore > 0 ? '+' : ''}{(z.cvdScore || 0).toLocaleString('ru-RU', { maximumFractionDigits: 0 })}
+                          </div>
+                        </div>
+                        <div>
+                          <span className="text-[#64748b] text-[8px]">OI Change:</span>
+                          <div className="text-[#38bdf8] font-bold mt-0.5 font-mono">
+                            {z.oiScore && z.oiScore > 0 ? `+` : ''}{(z.oiScore || 0).toLocaleString('ru-RU', { maximumFractionDigits: 0 })}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })
+            )}
+          </div>
+        </div>
+      )}
     </div>
-  );
+  </div>
+);
 }
