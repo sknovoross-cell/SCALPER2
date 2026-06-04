@@ -87,6 +87,17 @@ export function SettingsPanel({ config, onChange }: SettingsPanelProps) {
                      })} 
                    />
                  </label>
+                 <label className="flex items-center justify-between cursor-pointer select-none">
+                   <span className="text-[#f59e0b]">Predictive Liquidation (Предикт. Ликвид.)</span>
+                   <input 
+                     type="checkbox" 
+                     className="w-3.5 h-3.5 accent-[#f59e0b] cursor-pointer" 
+                     checked={config.execution.predictiveLiqEnabled} 
+                     onChange={e => onChange({
+                       execution: { ...config.execution, predictiveLiqEnabled: e.target.checked }
+                     })} 
+                   />
+                 </label>
               </div>
             </div>
          </div>

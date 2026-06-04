@@ -1,6 +1,18 @@
-import { useState } from 'react';
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, ReferenceDot } from 'recharts';
+import { useState, useEffect } from 'react';
+import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, ReferenceDot, CartesianGrid } from 'recharts';
 import { ChartCandle, LiquidityZone, HistorisedTrade } from '../types';
+import { 
+  Maximize2, 
+  Minimize2, 
+  ZoomIn, 
+  ZoomOut, 
+  Grid, 
+  Eye, 
+  EyeOff, 
+  RotateCcw,
+  TrendingUp,
+  Activity
+} from 'lucide-react';
 
 interface MarketChartProps {
   data: ChartCandle[];
@@ -11,16 +23,49 @@ interface MarketChartProps {
 }
 
 export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] }: MarketChartProps) {
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [chartType, setChartType] = useState<'area' | 'line'>('area');
+  const [gridEnabled, setGridEnabled] = useState(true);
+  const [showZones, setShowZones] = useState(true);
+  const [showPredLiq, setShowPredLiq] = useState(true);
+  const [showTrades, setShowTrades] = useState(true);
+  const [zoomCount, setZoomCount] = useState(100);
+  const [yScaleBuffer, setYScaleBuffer] = useState(1.0);
   const [hoveredZone, setHoveredZone] = useState<{ cx: number; cy: number; zone: LiquidityZone } | null>(null);
 
+  // Esc key listener for fullscreen exit
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && isFullscreen) {
+        setIsFullscreen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isFullscreen]);
+
+  const resetChartSettings = () => {
+    setZoomCount(100);
+    setYScaleBuffer(1.0);
+    setChartType('area');
+    setGridEnabled(true);
+    setShowZones(true);
+    setShowPredLiq(true);
+    setShowTrades(true);
+  };
+
+  // Slice visible data based on time zoom level
+  const visibleData = data.slice(-zoomCount);
+
   // Use slightly larger domain window to see zones above/below current price
-  const dataMin = data.length > 0 ? Math.min(...data.map(d => d.low)) : 64000;
-  const dataMax = data.length > 0 ? Math.max(...data.map(d => d.high)) : 65000;
+  const dataMin = visibleData.length > 0 ? Math.min(...visibleData.map(d => d.low)) : 64000;
+  const dataMax = visibleData.length > 0 ? Math.max(...visibleData.map(d => d.high)) : 65000;
   
   // Dynamic Y-axis margins (padding) based on total scale of the active chart timeframe to prevent
   // lines and labels at the absolute top/bottom extremes from clashing with borders or time axis/ticks.
   const rangeY = dataMax - dataMin;
-  const bufferY = Math.max(80, rangeY * 0.08);
+  const baseBuffer = Math.max(80, rangeY * 0.08);
+  const bufferY = baseBuffer * yScaleBuffer;
   const minDomain = dataMin - bufferY;
   const maxDomain = dataMax + bufferY;
 
@@ -46,19 +91,27 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
   const visibleZones = relevantZones.filter(z => z.price >= minDomain && z.price <= maxDomain);
   const sortedZones = [...visibleZones].sort((a, b) => a.price - b.price);
   
-  const resolvedZones = sortedZones.map((z, index) => {
-    let position: 'insideTopLeft' | 'insideBottomLeft' = 'insideTopLeft';
-    
-    // If this zone is practically touching the previous zone's label, swap its alignment to spread them apart
-    if (index > 0) {
-      const prevZone = sortedZones[index - 1];
-      const priceDiff = z.price - prevZone.price;
-      if (priceDiff < (maxDomain - minDomain) * 0.045) {
-        position = 'insideBottomLeft';
+  const resolvedZones = sortedZones
+    .filter(z => {
+      const isPredLiq = z.type.startsWith("PRED LIQ");
+      const isActivePosLiq = z.type === "ACTIVE POS LIQ";
+      if (!showZones && !isPredLiq && !isActivePosLiq) return false;
+      if (!showPredLiq && (isPredLiq || isActivePosLiq)) return false;
+      return true;
+    })
+    .map((z, index, arr) => {
+      let position: 'insideTopLeft' | 'insideBottomLeft' = 'insideTopLeft';
+      
+      // If this zone is practically touching the previous zone's label, swap its alignment to spread them apart
+      if (index > 0) {
+        const prevZone = arr[index - 1];
+        const priceDiff = z.price - prevZone.price;
+        if (priceDiff < (maxDomain - minDomain) * 0.045) {
+          position = 'insideBottomLeft';
+        }
       }
-    }
-    return { ...z, position };
-  });
+      return { ...z, position };
+    });
 
   // Helper to parse time string like "HH:MM:SS" or "HH:MM" into seconds from midnight
   const timeToSeconds = (tStr: string): number => {
@@ -76,17 +129,17 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
   // Find the closest candlestick of the chart data for each trade timestamp so they can be plotted accurately on the XAxis time points
   const resolvedTrades = (trades || [])
     .map(trade => {
-      if (!data || data.length === 0) return null;
+      if (!visibleData || visibleData.length === 0) return null;
       
-      let closestCandle = data[0];
+      let closestCandle = visibleData[0];
       
       if (timeframe === '1d') {
-        closestCandle = data[data.length - 1];
+        closestCandle = visibleData[visibleData.length - 1];
       } else {
         const tradeSecs = timeToSeconds(trade.timestamp);
         let minDiff = Infinity;
         
-        for (const candle of data) {
+        for (const candle of visibleData) {
           const candleSecs = timeToSeconds(candle.time);
           const diff = Math.abs(candleSecs - tradeSecs);
           if (diff < minDiff) {
@@ -135,17 +188,23 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
     );
   };
 
-  const leftEdgeX = data.length > 0 ? data[1]?.time || data[0].time : undefined;
+  const leftEdgeX = visibleData.length > 0 ? visibleData[1]?.time || visibleData[0].time : undefined;
+
+  const containerClasses = isFullscreen 
+    ? "fixed inset-0 z-[9999] bg-[#070b14] flex flex-col p-6 w-screen h-screen overflow-hidden" 
+    : "flex-1 bg-[#0a0f1d]/80 border border-[#1a2233] rounded-lg p-4 flex flex-col z-10 w-full min-h-0 relative";
 
   return (
-    <div className="flex-1 bg-[#0a0f1d]/80 border border-[#1a2233] rounded-lg p-4 flex flex-col z-10 w-full min-h-0 relative">
+    <div className={containerClasses} id="tradingview-chart-container">
       <div className="absolute top-0 right-0 p-4 opacity-10 pointer-events-none">
         <div className="w-32 h-32 bg-[#38bdf8] rounded-full blur-[80px]"></div>
       </div>
 
+      {/* Main Title & Timeframes Row */}
       <div className="flex justify-between items-center mb-4 border-b border-[#1a2233]/50 pb-3 flex-wrap gap-2">
         <div>
-          <h2 className="text-[11px] font-bold text-[#64748b] uppercase mb-0.5 tracking-wider">
+          <h2 className="text-[11px] font-bold text-[#64748b] uppercase mb-0.5 tracking-wider flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-[#38bdf8] animate-pulse"></span>
             Карта Ликвидности (Real-time {timeframe.toUpperCase()} BTCUSDT)
           </h2>
           <p className="text-[9px] text-[#38bdf8] opacity-80 uppercase tracking-widest">
@@ -168,6 +227,139 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
               {tf.toUpperCase()}
             </button>
           ))}
+        </div>
+      </div>
+
+      {/* TradingView-style Interactive Toolbar */}
+      <div className="flex items-center justify-between gap-4 bg-[#111827]/65 border border-[#1a2233]/50 rounded-md px-3 py-1.5 mb-3 text-xs flex-wrap z-20">
+        <div className="flex items-center gap-4 flex-wrap">
+          {/* Chart Type Toggle */}
+          <div className="flex items-center gap-1 border-r border-[#1a2233]/50 pr-4">
+            <span className="text-[9px] uppercase font-bold text-[#64748b] tracking-wider select-none">Вид:</span>
+            <button
+              onClick={() => setChartType('area')}
+              className={`p-1 rounded transition-all cursor-pointer ${chartType === 'area' ? 'text-[#38bdf8] bg-[#38bdf8]/15' : 'text-gray-400 hover:text-white hover:bg-[#1a2233]/30'}`}
+              title="Область (Area)"
+            >
+              <TrendingUp className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={() => setChartType('line')}
+              className={`p-1 rounded transition-all cursor-pointer ${chartType === 'line' ? 'text-[#38bdf8] bg-[#38bdf8]/15' : 'text-gray-400 hover:text-white hover:bg-[#1a2233]/30'}`}
+              title="Линия (Line)"
+            >
+              <Activity className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Grid Toggle */}
+          <div className="flex items-center gap-1 border-r border-[#1a2233]/50 pr-4">
+            <span className="text-[9px] uppercase font-bold text-[#64748b] tracking-wider select-none mr-1">Сетка:</span>
+            <button
+              onClick={() => setGridEnabled(!gridEnabled)}
+              className={`p-1 rounded transition-all cursor-pointer flex items-center ${gridEnabled ? 'text-[#38bdf8] bg-[#38bdf8]/15' : 'text-gray-400 hover:text-white hover:bg-[#1a2233]/30'}`}
+              title="Вкл/Выкл сетку"
+            >
+              <Grid className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Visibility Layers */}
+          <div className="flex items-center gap-1 border-r border-[#1a2233]/50 pr-4">
+            <span className="text-[9px] uppercase font-bold text-[#64748b] tracking-wider select-none mr-1">Слои ТА:</span>
+            <button
+              onClick={() => setShowZones(!showZones)}
+              className={`px-1.5 py-0.5 rounded transition-all cursor-pointer flex items-center gap-1 border border-transparent ${showZones ? 'text-green-400 bg-green-400/15 border-green-500/20' : 'text-gray-400 hover:text-white hover:bg-[#1a2233]/30'}`}
+              title="Панель технического анализа (S/R)"
+            >
+              {showZones ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
+              <span className="text-[9px] font-bold font-mono">S/R</span>
+            </button>
+            <button
+              onClick={() => setShowPredLiq(!showPredLiq)}
+              className={`px-1.5 py-0.5 rounded transition-all cursor-pointer flex items-center gap-1 border border-transparent ${showPredLiq ? 'text-yellow-400 bg-yellow-400/15 border-yellow-500/20' : 'text-gray-400 hover:text-white hover:bg-[#1a2233]/30'}`}
+              title="Предиктивные ликвидации (Liquidity)"
+            >
+              {showPredLiq ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
+              <span className="text-[9px] font-bold font-mono">LIQ</span>
+            </button>
+            <button
+              onClick={() => setShowTrades(!showTrades)}
+              className={`px-1.5 py-0.5 rounded transition-all cursor-pointer flex items-center gap-1 border border-transparent ${showTrades ? 'text-indigo-400 bg-indigo-400/15 border-indigo-500/20' : 'text-gray-400 hover:text-white hover:bg-[#1a2233]/30'}`}
+              title="Сделки на графике"
+            >
+              {showTrades ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
+              <span className="text-[9px] font-bold font-mono">TRADES</span>
+            </button>
+          </div>
+
+          {/* Time Zoom Controls */}
+          <div className="flex items-center gap-2 border-r border-[#1a2233]/50 pr-4">
+            <span className="text-[9px] uppercase font-bold text-[#64748b] tracking-wider select-none">Зум:</span>
+            <button
+              onClick={() => setZoomCount(prev => Math.max(20, prev - 15))}
+              className="p-1 text-gray-400 hover:text-white hover:bg-[#1a2233]/30 rounded cursor-pointer transition-all"
+              title="Сфокусировать / Приблизить свечи"
+            >
+              <ZoomIn className="w-3.5 h-3.5" />
+            </button>
+            <span className="text-[10px] font-mono font-bold text-gray-300 w-9 text-center select-none bg-[#111827] px-1 py-0.5 rounded border border-[#1a2233]/60">{zoomCount}б</span>
+            <button
+              onClick={() => setZoomCount(prev => Math.min(250, prev + 15))}
+              className="p-1 text-gray-400 hover:text-white hover:bg-[#1a2233]/30 rounded cursor-pointer transition-all"
+              title="Вся история / Отдалить свечи"
+            >
+              <ZoomOut className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Vertical Scale (Stretch / Compress) */}
+          <div className="flex items-center gap-2">
+            <span className="text-[9px] uppercase font-bold text-[#64748b] tracking-wider select-none">Высота Y:</span>
+            <input
+              type="range"
+              min="0.3"
+              max="2.5"
+              step="0.1"
+              value={yScaleBuffer}
+              onChange={(e) => setYScaleBuffer(parseFloat(e.target.value))}
+              className="w-16 h-1 bg-[#1a2233] rounded-lg appearance-none cursor-pointer accent-[#38bdf8]"
+              title="Масштаб амплитуды по вертикали"
+            />
+            <span className="text-[9px] font-mono text-[#38bdf8] font-bold select-none">{yScaleBuffer.toFixed(1)}x</span>
+          </div>
+        </div>
+
+        {/* Global Controls */}
+        <div className="flex items-center gap-2">
+          {/* Reset settings */}
+          <button
+            onClick={resetChartSettings}
+            className="p-1.5 text-gray-400 hover:text-[#38bdf8] hover:bg-[#38bdf8]/15 rounded flex items-center gap-1 transition-all cursor-pointer border border-[#1a2233]/40"
+            title="Сбросить все параметры"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span className="text-[9px] font-bold uppercase tracking-wider hidden sm:inline">Сброс</span>
+          </button>
+
+          {/* Fullscreen Button */}
+          <button
+            onClick={() => setIsFullscreen(!isFullscreen)}
+            className="p-1.5 text-[#38bdf8] hover:bg-[#38bdf8]/15 border border-[#38bdf8]/30 rounded flex items-center gap-1.5 transition-all cursor-pointer font-bold shadow-[0_0_8px_rgba(55,189,248,0.05)]"
+            title={isFullscreen ? "Выйти из полного экрана [Esc]" : "Развернуть во весь экран"}
+          >
+            {isFullscreen ? (
+              <>
+                <Minimize2 className="w-3.5 h-3.5" />
+                <span className="text-[9px] uppercase tracking-wider">Свернуть</span>
+              </>
+            ) : (
+              <>
+                <Maximize2 className="w-3.5 h-3.5" />
+                <span className="text-[9px] uppercase tracking-wider">Весь экран</span>
+              </>
+            )}
+          </button>
         </div>
       </div>
       
@@ -210,22 +402,34 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
         </div>
       )}
 
-      <div className="flex-1 min-h-[300px]">
+      {/* Main Chart Canvas Area */}
+      <div className="flex-1 min-h-[350px]">
         <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={data} margin={{ top: 10, right: 0, left: 15, bottom: 0 }}>
+          <AreaChart data={visibleData} margin={{ top: 15, right: 5, left: 15, bottom: 0 }}>
             <defs>
               <linearGradient id="colorClose" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="5%" stopColor="#38bdf8" stopOpacity={0.4}/>
                 <stop offset="95%" stopColor="#0a0f1d" stopOpacity={0}/>
               </linearGradient>
             </defs>
+
+            {gridEnabled && (
+              <CartesianGrid 
+                stroke="#1a2233" 
+                strokeDasharray="3 3" 
+                opacity={0.25} 
+                vertical={true}
+                horizontal={true}
+              />
+            )}
+
             <XAxis 
               dataKey="time" 
               stroke="#1a2233" 
               tick={{fill: '#64748b', fontSize: 10}} 
               tickLine={false} 
               axisLine={{stroke: '#1a2233'}}
-              minTickGap={30}
+              minTickGap={35}
             />
             <YAxis 
               domain={[minDomain, maxDomain]} 
@@ -238,7 +442,7 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
             />
             <Tooltip 
               contentStyle={{ backgroundColor: '#050608', borderColor: '#1a2233', fontSize: '11px', fontFamily: 'monospace' }} 
-              itemStyle={{ color: '#00ff41' }} 
+              itemStyle={{ color: '#38bdf8' }} 
               labelStyle={{ color: '#64748b', marginBottom: '4px' }}
             />
             <Area 
@@ -246,7 +450,7 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
               dataKey="close" 
               stroke="#38bdf8" 
               strokeWidth={2}
-              fillOpacity={1} 
+              fillOpacity={chartType === 'area' ? 1 : 0} 
               fill="url(#colorClose)" 
               isAnimationActive={false} 
             />
@@ -262,9 +466,7 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
                   strokeOpacity={isLtf ? 0.35 : 0.75} 
                   strokeWidth={isLtf ? 1 : 1.5} 
                   strokeDasharray={isLtf ? "2 3" : "5 2"}
-                >
-                  <span className="fill-current text-[#1a2233] hidden"></span>
-                </ReferenceLine>
+                />
               );
             })}
 
@@ -301,9 +503,9 @@ export function MarketChart({ data, zones, timeframe, setTimeframe, trades = [] 
             ))}
 
             {/* Historical Entry and Exit Trade point overlays */}
-            {resolvedTrades.map((trade, idx) => {
-              const isEntry = trade.type.includes('ENTRY') || trade.type.includes('MANUAL ENTRY');
+            {showTrades && resolvedTrades.map((trade, idx) => {
               const isBuy = trade.side === 'BUY';
+              const isEntry = trade.type.includes('ENTRY') || trade.type.includes('MANUAL ENTRY');
               const color = isBuy ? '#10b981' : '#f43f5e';
               
               return (

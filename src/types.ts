@@ -74,6 +74,7 @@ export interface AppConfig {
     partialTakeProfitEnabled: boolean;
     signalExitEnabled: boolean;
     feeExitEnabled: boolean;
+    predictiveLiqEnabled: boolean;
   };
 }
 

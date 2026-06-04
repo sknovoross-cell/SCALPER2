@@ -31,7 +31,8 @@ const INITIAL_CONFIG: AppConfig = {
     trailingStopEnabled: true,
     partialTakeProfitEnabled: true,
     signalExitEnabled: true,
-    feeExitEnabled: false
+    feeExitEnabled: false,
+    predictiveLiqEnabled: true
   }
 };
 
@@ -727,86 +728,175 @@ export function useEngine() {
       });
 
       // Update unrealized PNL on the open position
-      const activePos = positionRef.current;
-      if (activePos) {
-         const pnlDiff = activePos.side === 'BUY' ? (newPrice - activePos.entryPrice) : (activePos.entryPrice - newPrice);
-         // Leverage 10x logic
-         const rawPnL = pnlDiff * activePos.size;
-         const margin = (activePos.entryPrice * activePos.size) / 10; // 10x leverage margin
-         const pnlPct = (rawPnL / margin) * 100;
-         setPosition({
-           ...activePos,
-           unrealizedPnL: rawPnL,
-           unrealizedPnLPct: pnlPct
-         });
+      if (positionRef.current) {
+         const active = positionRef.current;
+         const diff = newPrice - active.entryPrice;
+         const pnl = active.side === 'BUY' ? diff * active.size : -diff * active.size;
+         const pnlPct = (pnl / (active.entryPrice * active.size)) * 100 * 10;
+         
+         const updatedPos = {
+            ...active,
+            unrealizedPnL: pnl,
+            unrealizedPnLPct: pnlPct
+         };
+         setPosition(updatedPos);
+         positionRef.current = updatedPos;
       }
 
-      // Dynamically reclassify zones based on relation to the new price in real-time
+      const baseZones = currentZones.filter(z => 
+        !z.type.startsWith("PRED LIQ") && z.type !== "ACTIVE POS LIQ"
+      );
+
       let anyZoneChanged = false;
-      const updatedZones = currentZones.map(z => {
-        const isResistance = z.price >= newPrice;
-        const currentIsResistance = z.type.includes('RESIST') || z.type.includes('HIGH');
-        
-        if (isResistance !== currentIsResistance) {
-          anyZoneChanged = true;
-          const tfUpper = (z.timeframe || '1m').toUpperCase();
-          let finalType = z.type;
-          let finalColor = z.color;
-          
-          if (z.timeframe === '1d') {
-            finalType = isResistance ? "1D SWING RESIST" : "1D SWING SUPPORT";
-            finalColor = isResistance ? "#f43f5e" : "#3b82f6";
-          } else {
-            finalType = isResistance ? `${tfUpper} RESIST` : `${tfUpper} SUPPORT`;
-            if (z.timeframe === '4h') {
-              finalColor = isResistance ? "#f59e0b" : "#10b981";
-            } else if (z.timeframe === '1h') {
-              finalColor = isResistance ? "#d946ef" : "#06b6d4";
-            } else if (z.timeframe === '15m') {
-              finalColor = isResistance ? "#84cc16" : "#a855f7";
-            } else { // 5m
-              finalColor = isResistance ? "#fb7185" : "#38bdf8";
+      const updatedBaseZones = baseZones.map(z => {
+         const isResistance = z.price >= newPrice;
+         const currentIsResistance = z.type.includes('RESIST') || z.type.includes('HIGH');
+         
+         if (isResistance !== currentIsResistance) {
+           anyZoneChanged = true;
+           const tfUpper = (z.timeframe || '1m').toUpperCase();
+           let finalType = z.type;
+           let finalColor = z.color;
+           
+           if (z.timeframe === '1d') {
+             finalType = isResistance ? "1D SWING RESIST" : "1D SWING SUPPORT";
+             finalColor = isResistance ? "#f43f5e" : "#3b82f6";
+           } else {
+             finalType = isResistance ? `${tfUpper} RESIST` : `${tfUpper} SUPPORT`;
+             if (z.timeframe === '4h') {
+               finalColor = isResistance ? "#f59e0b" : "#10b981";
+             } else if (z.timeframe === '1h') {
+               finalColor = isResistance ? "#d946ef" : "#06b6d4";
+             } else if (z.timeframe === '15m') {
+               finalColor = isResistance ? "#84cc16" : "#a855f7";
+             } else { // 5m
+               finalColor = isResistance ? "#fb7185" : "#38bdf8";
+             }
+           }
+           
+           const criteria: string[] = [];
+           if (z.timeframe === '1d') {
+             criteria.push("Крайние точки диапазона (Swing): Абсолютный экстремум за 30 дней.");
+             criteria.push(isResistance ? "Пул ликвидности (HTF): Высокая плотность лимитных ордеров на продажу." : "Пул ликвидности (HTF): Высокая плотность лимитных ордеров на покупку.");
+             criteria.push("Объемный профиль: Крупный исторический горизонтальный узел.");
+           } else if (z.levelStrength === 'HTF') {
+             criteria.push(`Сильный разворот ${tfUpper}: Подтвержденная 3-барная структура.`);
+             criteria.push(isResistance ? "Защита уровня (Resist): Лимитные заявки продавцов (Ask blocks)." : "Защита уровня (Support): Лимитные заявки покупателей (Bid blocks).");
+             criteria.push("Подтверждение CVD: Обнаружены следы агрессивного поглощения.");
+           } else {
+             criteria.push(`Микро-свинг ${tfUpper}: Быстрый локальный экстремум.`);
+             criteria.push(isResistance ? "Зона предложения рынка: Возможный ложный пробой." : "Зона спроса рынка: Ожидаемая реакция покупателя.");
+             criteria.push("Краткосрочный импульс: Подходит для скальпинг-пробоев.");
+           }
+           
+           return {
+             ...z,
+             type: finalType,
+             color: finalColor,
+             updatedAt: new Date().toLocaleTimeString('ru-RU'),
+             validationCriteria: criteria
+           };
+         }
+         return z;
+      });
+
+      // Recalculate and inject predictive liquidation lines gracefully (no clutter!)
+      const nextZonesList = [...updatedBaseZones];
+      
+      if (configRef.current.execution.predictiveLiqEnabled) {
+        // Nearest support below newPrice
+        const supportZones = updatedBaseZones.filter(z => z.type.includes('SUPPORT') || z.type.includes('LOW'));
+        let closestSupport: LiquidityZone | null = null;
+        let minSupDist = Infinity;
+        supportZones.forEach(z => {
+          if (z.price < newPrice) {
+            const dist = newPrice - z.price;
+            if (dist < minSupDist) {
+              minSupDist = dist;
+              closestSupport = z;
             }
           }
-          
-          const criteria: string[] = [];
-          if (z.timeframe === '1d') {
-            criteria.push("Крайние точки диапазона (Swing): Абсолютный экстремум за 30 дней.");
-            criteria.push(isResistance ? "Пул ликвидности (HTF): Высокая плотность лимитных ордеров на продажу." : "Пул ликвидности (HTF): Высокая плотность лимитных ордеров на покупку.");
-            criteria.push("Объемный профиль: Крупный исторический горизонтальный узел.");
-          } else if (z.levelStrength === 'HTF') {
-            criteria.push(`Сильный разворот ${tfUpper}: Подтвержденная 3-барная структура.`);
-            criteria.push(isResistance ? "Защита уровня (Resist): Лимитные заявки продавцов (Ask blocks)." : "Защита уровня (Support): Лимитные заявки покупателей (Bid blocks).");
-            criteria.push("Подтверждение CVD: Обнаружены следы агрессивного поглощения.");
-          } else {
-            criteria.push(`Микро-свинг ${tfUpper}: Быстрый локальный экстремум.`);
-            criteria.push(isResistance ? "Зона предложения рынка: Возможный ложный пробой." : "Зона спроса рынка: Ожидаемая реакция покупателя.");
-            criteria.push("Краткосрочный импульс: Подходит для скальпинг-пробоев.");
+        });
+
+        // Nearest resistance above newPrice
+        const resistanceZones = updatedBaseZones.filter(z => z.type.includes('RESIST') || z.type.includes('HIGH'));
+        let closestResistance: LiquidityZone | null = null;
+        let minResDist = Infinity;
+        resistanceZones.forEach(z => {
+          if (z.price > newPrice) {
+            const dist = z.price - newPrice;
+            if (dist < minResDist) {
+              minResDist = dist;
+              closestResistance = z;
+            }
           }
-          
-          return {
-            ...z,
-            type: finalType,
-            color: finalColor,
+        });
+
+        // Add 100x/50x Long Retail Liquidations (0.4% below nearest support)
+        if (closestSupport) {
+          nextZonesList.push({
+            price: +(closestSupport.price * 0.996).toFixed(1),
+            type: "PRED LIQ (LONGS)",
+            color: "#eab308", // Golden Yellow
+            levelStrength: "LTF",
+            timeframe: closestSupport.timeframe || '1h',
             updatedAt: new Date().toLocaleTimeString('ru-RU'),
-            validationCriteria: criteria
-          };
+            validationCriteria: [
+              "Предиктивный уровень принудительного закрытия розничных лонг-позиций.",
+              "Срабатывает при пробое зоны локальной поддержки на повышенных объемах."
+            ]
+          });
         }
-        return z;
-      });
-      
-      let resolvedCurrentZones = currentZones;
-      if (anyZoneChanged) {
-        setZones(updatedZones);
-        zonesRef.current = updatedZones;
-        resolvedCurrentZones = updatedZones;
+
+        // Add 100x/50x Short Retail Liquidations (0.4% above nearest resistance)
+        if (closestResistance) {
+          nextZonesList.push({
+            price: +(closestResistance.price * 1.004).toFixed(1),
+            type: "PRED LIQ (SHORTS)",
+            color: "#f43f5e", // Light red
+            levelStrength: "LTF",
+            timeframe: closestResistance.timeframe || '1h',
+            updatedAt: new Date().toLocaleTimeString('ru-RU'),
+            validationCriteria: [
+              "Предиктивный уровень принудительного закрытия розничных шорт-позиций.",
+              "Срабатывает при пробое зоны локальной сопротивления на повышенных объемах."
+            ]
+          });
+        }
+
+        // Add your own active position liquidation price line (10x leverage MM model)
+        const activePos = positionRef.current;
+        if (activePos) {
+          const isBuy = activePos.side === 'BUY';
+          const posLiqPrice = isBuy ? activePos.entryPrice * 0.905 : activePos.entryPrice * 1.095;
+          nextZonesList.push({
+            price: +posLiqPrice.toFixed(1),
+            type: "ACTIVE POS LIQ",
+            color: "#ef4444", // Bright Red
+            levelStrength: "HTF", // Solid/bold
+            timeframe: activePos.timeframe || '1m',
+            updatedAt: new Date().toLocaleTimeString('ru-RU'),
+            validationCriteria: [
+              "Уровень принудительной ликвидации Вашей открытой позиции (10х маржинальное плечо).",
+              "Гарантированный Margin Call при достижении отметки без защитного закрытия.",
+              `Вход позиции: $${activePos.entryPrice.toFixed(1)} | Объём: ${activePos.size} BTC`
+            ]
+          });
+        }
       }
+      
+      setZones(nextZonesList);
+      zonesRef.current = nextZonesList;
+      const resolvedCurrentZones = nextZonesList;
 
       // Recalculate precise distances to technical zones with finalized tick price
       minD = Infinity;
       nearestZoneIndex = -1;
       
       resolvedCurrentZones.forEach((z, idx) => {
+        // Skip predictive layers to keep trading triggers locked to actual support/resistance limits
+        if (z.type.startsWith("PRED LIQ") || z.type === "ACTIVE POS LIQ") return;
+        
         const dist = Math.abs(z.price - newPrice);
         if (dist < minD) {
           minD = dist;
