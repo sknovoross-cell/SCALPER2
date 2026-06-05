@@ -108,6 +108,33 @@ export function calculateTargetPrices(
   }
 }
 
+export function calculateATR(candles: any[], period = 14): number {
+  if (!candles || candles.length < period + 1) {
+    if (!candles || candles.length === 0) return 40; // Default fallback for BTC
+    const ranges = candles.map(c => c.high - c.low);
+    ranges.sort((a, b) => a - b);
+    return ranges[Math.floor(ranges.length / 2)] || 40;
+  }
+  let trs: number[] = [];
+  for (let i = 1; i < candles.length; i++) {
+    const high = candles[i].high;
+    const low = candles[i].low;
+    const prevClose = candles[i - 1].close;
+    const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
+    trs.push(tr);
+  }
+  const trsSlice = trs.slice(-period);
+  return trsSlice.reduce((acc, val) => acc + val, 0) / trsSlice.length;
+}
+
+export function getMedianVolume(candles: any[]): number {
+  if (!candles || candles.length === 0) return 100;
+  const vols = candles.map(c => c.volume || 0).filter(v => v > 0);
+  if (vols.length === 0) return 100;
+  vols.sort((a, b) => a - b);
+  return vols[Math.floor(vols.length / 2)];
+}
+
 export function useEngine() {
   const [config, setConfig] = useState<AppConfig>(INITIAL_CONFIG);
   const configRef = useRef<AppConfig>(config);
@@ -155,6 +182,7 @@ export function useEngine() {
   const cvdCumulativeRef = useRef<number>(0);
   const tapeSpeedHistoryRef = useRef<number[]>([]);
   const oiRef = useRef<number>(1342.50); // Live-mode Open Interest modeling value ($ million)
+  const prevOiRef = useRef<number>(1342.50);
   const cooldownTicksRef = useRef<number>(0);
 
   const [timeframe, setTimeframe] = useState<string>('1m');
@@ -218,7 +246,7 @@ export function useEngine() {
         fetchOI("1d", 30)
       ]);
 
-      // A helper to parse candles beautifully or generate high-fidelity simulated backups if fetch fails
+      // A helper to parse candles beautifully - absolutely ZERO simulation
       function parseOrSimulate(raw: any[][] | null, intervalName: string, count: number, startPrice: number) {
         if (raw && Array.isArray(raw) && raw.length > 0) {
           return raw.map((d: any) => {
@@ -246,71 +274,23 @@ export function useEngine() {
           });
         }
 
-        // If periodic, avoid wiping cache if backend fails
-        if (isPeriodic && klinesCacheRef.current[intervalName]?.length > 0) {
+        // Return cache if it has items
+        if (klinesCacheRef.current[intervalName]?.length > 0) {
           return klinesCacheRef.current[intervalName];
         }
 
-        const nowMs = Date.now();
-        const simulated = [];
-        let lastClose = startPrice;
-        let scaleFactor = 1;
-        if (intervalName === '5m') scaleFactor = 2;
-        if (intervalName === '15m') scaleFactor = 4;
-        if (intervalName === '1h') scaleFactor = 8;
-        if (intervalName === '4h') scaleFactor = 16;
-        if (intervalName === '1d') scaleFactor = 35;
-
-        for (let i = count; i > 0; i--) {
-          const t = nowMs - i * 60000 * scaleFactor;
-          const open = lastClose;
-          const drift = (Math.random() - 0.5) * 60 * (scaleFactor * 0.5 + 0.5);
-          const close = +(open + drift).toFixed(2);
-          const high = +(Math.max(open, close) + Math.random() * 20 * (scaleFactor * 0.4 + 0.6)).toFixed(2);
-          const low = +(Math.min(open, close) - Math.random() * 20 * (scaleFactor * 0.4 + 0.6)).toFixed(2);
-          lastClose = close;
-
-          let timeVal = "";
-          if (intervalName === "1d") {
-            timeVal = new Date(t).toLocaleDateString("ru-RU", { day: '2-digit', month: '2-digit' });
-          } else {
-            timeVal = new Date(t).toLocaleTimeString("ru-RU", { hour12: false, hour: '2-digit', minute: '2-digit' });
-          }
-
-          const volume = Math.random() * 800 * (scaleFactor * 0.6 + 0.4) + 100;
-          const takerVolume = volume * (0.47 + Math.random() * 0.06);
-          const cvd = takerVolume * 2 - volume;
-
-          simulated.push({
-            time: timeVal,
-            open,
-            high,
-            low,
-            close,
-            volume,
-            takerVolume,
-            cvd,
-            rawTimestamp: t
-          });
-        }
-        return simulated;
+        return [];
       }
 
-      // Aligns Open Interest metrics to parsed candles
+      // Aligns Open Interest metrics to parsed candles without synthetic random walk simulation
       function alignOIWithCandles(candles: any[], oiRaw: any[] | null) {
+        if (!candles || candles.length === 0) return [];
         if (!oiRaw || !Array.isArray(oiRaw) || oiRaw.length === 0) {
-          let currentOI = 43500;
-          return candles.map(c => {
-            const vol = c.volume || 100;
-            const cvd = c.cvd || 0;
-            const oiChange = (cvd * 0.01) + (vol * 0.005) * (Math.random() - 0.4);
-            currentOI = +(currentOI + oiChange).toFixed(2);
-            return { ...c, oi: currentOI };
-          });
+          return candles.map(c => ({ ...c, oi: 0 }));
         }
 
         return candles.map(c => {
-          let bestVal = parseFloat(oiRaw[oiRaw.length - 1]?.sumOpenInterest) || 45000;
+          let bestVal = parseFloat(oiRaw[oiRaw.length - 1]?.sumOpenInterest) || 0;
           let minDiff = Infinity;
           for (const item of oiRaw) {
             const diff = Math.abs((item.timestamp || 0) - (c.rawTimestamp || 0));
@@ -356,6 +336,27 @@ export function useEngine() {
         aggRef.current.lastPrice = finalPrice;
       }
 
+      // Real-world Open Interest anchoring from API
+      if (oi5m && oi5m.length > 0) {
+        const latestOI = parseFloat(oi5m[oi5m.length - 1]?.sumOpenInterest);
+        if (!isNaN(latestOI) && latestOI > 0) {
+          oiRef.current = latestOI;
+        }
+      }
+
+      const atr1m = calculateATR(parsed1m, 14);
+      const atr5m = calculateATR(parsed5m, 14);
+      const atr15m = calculateATR(parsed15m, 14);
+      const atr1h = calculateATR(parsed1h, 14);
+      const atr4h = calculateATR(parsed4h, 14);
+      const atr1d = calculateATR(parsed1d, 14);
+
+      const med1m = getMedianVolume(parsed1m);
+      const med5m = getMedianVolume(parsed5m);
+      const med15m = getMedianVolume(parsed15m);
+      const med1h = getMedianVolume(parsed1h);
+      const med4h = getMedianVolume(parsed4h);
+
       // -----------------------------------------------------------------
       // Hierarchical Level Collector: Find key pivot levels at multiple timeframes
       // -----------------------------------------------------------------
@@ -384,6 +385,21 @@ export function useEngine() {
       ) {
         if (!candles || candles.length < 15) return;
         const len = candles.length;
+        
+        // Volatility adaptive ATR and median volume baselines per timeframe
+        const tfAtr = tfName === '1m' ? atr1m
+                    : tfName === '5m' ? atr5m
+                    : tfName === '15m' ? atr15m
+                    : tfName === '1h' ? atr1h
+                    : tfName === '4h' ? atr4h
+                    : atr1d;
+                    
+        const tfMedVol = tfName === '1m' ? med1m
+                       : tfName === '5m' ? med5m
+                       : tfName === '15m' ? med15m
+                       : tfName === '1h' ? med1h
+                       : tfName === '4h' ? med4h
+                       : 1000;
         
         // Dynamic window size: 2-bar wings for ultra-short 1m micro-signals, 3-bar for senior timeframes
         const windowSize = tfName === '1m' ? 2 : 3;
@@ -483,7 +499,7 @@ export function useEngine() {
               let accumCvd = Math.abs(totalCvd);
               let accumOi = Math.abs(oiChange);
               
-              const touchThreshold = currHigh * 0.0008; // 0.08% of price
+              const touchThreshold = tfAtr * 0.45; // Volatility adaptive retest boundary
               for (let j = i + 1; j < len; j++) {
                 const checkCandle = candles[j];
                 // If subsequent candle gets close to level
@@ -503,19 +519,27 @@ export function useEngine() {
                 finalScaleWeightAdjusted += 1.0;
               }
 
-              candidates.push({ 
-                price: currHigh, 
-                type: `${finalTfLabel} RESIST`, 
-                color: finalColorHigh, 
-                scale: finalScaleWeightAdjusted,
-                levelStrength: finalLevelStrength,
-                timeframe: finalTfName,
-                volumeScore: accumVolume,
-                cvdScore: accumCvd,
-                oiScore: accumOi,
-                touchesCount,
-                promotedStr
-              });
+              // STRICT VALIDATION FILTER DESIGN:
+              // 1. Minimum touches confirmation (junior profiles demand multiple consolidation hits to minimize noise)
+              const minTouchesNeeded = tfName === '1m' ? 3 : tfName === '5m' ? 2 : 1;
+              // 2. Volume validation: cumulative volume at key pivots must match median threshold
+              const minVolThreshold = tfMedVol * 1.0;
+
+              if (touchesCount >= minTouchesNeeded && accumVolume >= minVolThreshold) {
+                candidates.push({ 
+                  price: currHigh, 
+                  type: `${finalTfLabel} RESIST`, 
+                  color: finalColorHigh, 
+                  scale: finalScaleWeightAdjusted,
+                  levelStrength: finalLevelStrength,
+                  timeframe: finalTfName,
+                  volumeScore: accumVolume,
+                  cvdScore: accumCvd,
+                  oiScore: accumOi,
+                  touchesCount,
+                  promotedStr
+                });
+              }
             }
           }
           if (isPivotLow) {
@@ -537,7 +561,7 @@ export function useEngine() {
               let accumCvd = Math.abs(totalCvd);
               let accumOi = Math.abs(oiChange);
               
-              const touchThreshold = currLow * 0.0008; // 0.08% of price
+              const touchThreshold = tfAtr * 0.45; // Volatility adaptive retest boundary
               for (let j = i + 1; j < len; j++) {
                 const checkCandle = candles[j];
                 // If subsequent candle gets close to level
@@ -557,19 +581,25 @@ export function useEngine() {
                 finalScaleWeightAdjusted += 1.0;
               }
 
-              candidates.push({ 
-                price: currLow, 
-                type: `${finalTfLabel} SUPPORT`, 
-                color: finalColorLow, 
-                scale: finalScaleWeightAdjusted,
-                levelStrength: finalLevelStrength,
-                timeframe: finalTfName,
-                volumeScore: accumVolume,
-                cvdScore: accumCvd,
-                oiScore: accumOi,
-                touchesCount,
-                promotedStr
-              });
+              // STRICT VALIDATION FILTER DESIGN:
+              const minTouchesNeeded = tfName === '1m' ? 3 : tfName === '5m' ? 2 : 1;
+              const minVolThreshold = tfMedVol * 1.0;
+
+              if (touchesCount >= minTouchesNeeded && accumVolume >= minVolThreshold) {
+                candidates.push({ 
+                  price: currLow, 
+                  type: `${finalTfLabel} SUPPORT`, 
+                  color: finalColorLow, 
+                  scale: finalScaleWeightAdjusted,
+                  levelStrength: finalLevelStrength,
+                  timeframe: finalTfName,
+                  volumeScore: accumVolume,
+                  cvdScore: accumCvd,
+                  oiScore: accumOi,
+                  touchesCount,
+                  promotedStr
+                });
+              }
             }
           }
         }
@@ -767,7 +797,9 @@ export function useEngine() {
           volumeScore: cand.volumeScore,
           cvdScore: cand.cvdScore,
           oiScore: cand.oiScore,
-          touchesCount: cand.touchesCount || 1
+          touchesCount: cand.touchesCount || 1,
+          isBroken: false,
+          lastTouchTimestamp: Date.now()
         });
       });
 
@@ -965,6 +997,12 @@ export function useEngine() {
       if (oiRef.current > 1450) oiRef.current = 1450 - Math.random() * 10;
       const openInterest = oiRef.current;
 
+      const oiDelta = openInterest - prevOiRef.current;
+      prevOiRef.current = openInterest;
+
+      const totalVolTick = buyVol + sellVol;
+      const orderbookImbalance = totalVolTick > 0 ? (buyVol - sellVol) / totalVolTick : 0.0;
+
       // Reset trade count accumulator for next tick
       a.trades = 0;
       a.buyVol = 0;
@@ -1077,6 +1115,9 @@ export function useEngine() {
 
       let anyZoneChanged = false;
       const updatedBaseZones = baseZones.map(z => {
+         // Already broken junior levels stay broken
+         if (z.isBroken) return z;
+
          const isResistance = z.price >= newPrice;
          const currentIsResistance = z.type.includes('RESIST') || z.type.includes('HIGH');
          
@@ -1085,6 +1126,14 @@ export function useEngine() {
            const tfUpper = (z.timeframe || '1m').toUpperCase();
            let finalType = z.type;
            let finalColor = z.color;
+           let isBroken = false;
+           const newTouchesCount = (z.touchesCount || 1) + 1;
+           const lastTouchTimestamp = Date.now();
+
+           // Junior timeframe levels (1m, 5m) are retired (marked broken) upon crossing to maintain high fidelity
+           if (z.timeframe === '1m' || z.timeframe === '5m') {
+             isBroken = true;
+           }
            
            if (z.timeframe === '1d') {
              finalType = isResistance ? "1D SWING RESIST" : "1D SWING SUPPORT";
@@ -1103,6 +1152,10 @@ export function useEngine() {
            }
            
            const criteria: string[] = [];
+           if (isBroken) {
+             criteria.push(`[${new Date().toLocaleTimeString('ru-RU')}] Уровень пробит: Цена $${newPrice.toFixed(2)} пересекла профиль.`);
+           }
+
            if (z.timeframe === '1d') {
              criteria.push("Крайние точки диапазона (Swing): Абсолютный экстремум за 30 дней.");
              criteria.push(isResistance ? "Пул ликвидности (HTF): Высокая плотность лимитных ордеров на продажу." : "Пул ликвидности (HTF): Высокая плотность лимитных ордеров на покупку.");
@@ -1111,18 +1164,25 @@ export function useEngine() {
              criteria.push(`Сильный разворот ${tfUpper}: Подтвержденная 3-барная структура.`);
              criteria.push(isResistance ? "Защита уровня (Resist): Лимитные заявки продавцов (Ask blocks)." : "Защита уровня (Support): Лимитные заявки покупателей (Bid blocks).");
              criteria.push("Подтверждение CVD: Обнаружены следы агрессивного поглощения.");
-           } else {
+           } else if (!isBroken) {
              criteria.push(`Микро-свинг ${tfUpper}: Быстрый локальный экстремум.`);
              criteria.push(isResistance ? "Зона предложения рынка: Возможный ложный пробой." : "Зона спроса рынка: Ожидаемая реакция покупателя.");
              criteria.push("Краткосрочный импульс: Подходит для скальпинг-пробоев.");
            }
+
+           // Append active transition log
+           const timeStr = new Date().toLocaleTimeString('ru-RU');
+           criteria.push(`[${timeStr}] Ротация уровня: Увеличение касаний до ${newTouchesCount}. Уровень флипнут в ${isResistance ? "RESIST" : "SUPPORT"}.`);
            
            return {
              ...z,
              type: finalType,
              color: finalColor,
-             updatedAt: new Date().toLocaleTimeString('ru-RU'),
-             validationCriteria: criteria
+             updatedAt: timeStr,
+             validationCriteria: criteria,
+             isBroken,
+             touchesCount: newTouchesCount,
+             lastTouchTimestamp
            };
          }
          return z;
@@ -1222,8 +1282,8 @@ export function useEngine() {
       nearestZoneIndex = -1;
       
       resolvedCurrentZones.forEach((z, idx) => {
-        // Skip predictive layers to keep trading triggers locked to actual support/resistance limits
-        if (z.type.startsWith("PRED LIQ") || z.type === "ACTIVE POS LIQ") return;
+        // Skip predictive layers and broken levels to keep trading triggers locked to actual, intact support/resistance limits
+        if (z.type.startsWith("PRED LIQ") || z.type === "ACTIVE POS LIQ" || z.isBroken) return;
         
         const dist = Math.abs(z.price - newPrice);
         if (dist < minD) {
@@ -1265,30 +1325,58 @@ export function useEngine() {
               let signalMsg = "";
 
               if (isNearResistance && isTapeAccelerated) {
-                 // Option A: aggressive buying confirmation => TRUE BREAKOUT
-                 if (cvdDelta > 0.4) {
+                 // Option A: aggressive buying confirmation with OI growth & bid imbalance => TRUE BREAKOUT
+                 const meetsCvdBreakout = cvdDelta > 0.4;
+                 const meetsOiBreakout = oiDelta > -0.01;
+                 const meetsImbalanceBreakout = orderbookImbalance > 0.10;
+
+                 if (meetsCvdBreakout && meetsOiBreakout && meetsImbalanceBreakout) {
                     triggerEntrySide = 'BUY';
                     chosenStratType = 'BREAKOUT';
-                    signalMsg = `True Breakout confirmed at resistance ${nearestZone?.type || ''}. Speed Acceleration: ${tapeAcceleration.toFixed(1)}x. Strong buying CVD: +${cvdDelta.toFixed(2)}k. OI: $${openInterest.toFixed(1)}M.`;
+                    signalMsg = `True Breakout confirmed at resistance ${nearestZone?.type || ''}. Speed Acceleration: ${tapeAcceleration.toFixed(1)}x. Strong buying CVD: +${cvdDelta.toFixed(2)}k. OI: +${oiDelta.toFixed(3)}M. Imbalance: +${(orderbookImbalance * 100).toFixed(1)}% bids.`;
                  }
-                 // Option B: high transaction rate but negative/diverging buying => ABSORPTION FADE
-                 else if (cvdDelta < -0.2) {
-                    triggerEntrySide = 'SELL';
-                    chosenStratType = 'ABSORPTION_FADE';
-                    signalMsg = `Absorption Fade triggered at resistance ${nearestZone?.type || ''}. Fast transactions failed to break pivot. Large seller block absorbing bids. CVD: ${cvdDelta.toFixed(2)}k.`;
+                 // Option B: high transaction rate of buyers absorbed by passive limit sellers => ABSORPTION FADE
+                 else {
+                    const isExhaustionFade = cvdDelta < -0.2;
+                    const isActiveAbsorptionFade = cvdDelta > 0.2 && oiDelta > 0.01;
+                    const meetsImbalanceFade = orderbookImbalance < 0.25;
+
+                    if ((isExhaustionFade || isActiveAbsorptionFade) && meetsImbalanceFade) {
+                       triggerEntrySide = 'SELL';
+                       chosenStratType = 'ABSORPTION_FADE';
+                       signalMsg = `Absorption Fade triggered at resistance ${nearestZone?.type || ''}. ` +
+                         (isActiveAbsorptionFade 
+                            ? `Active Seller Limit Absorption: Buyers hit ask (CVD: +${cvdDelta.toFixed(2)}k) but price stalled. Fresh short OI accumulated: +${oiDelta.toFixed(3)}M.` 
+                            : `Aggressive Seller Backing: Tape accelerated but CVD buying exhausted to sell-off (CVD Delta: ${cvdDelta.toFixed(2)}k).`) +
+                            ` Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids.`;
+                    }
                  }
               } else if (isNearSupport && isTapeAccelerated) {
-                 // Option A: aggressive selling confirmation => TRUE BREAKOUT
-                 if (cvdDelta < -0.4) {
+                 // Option A: aggressive selling confirmation with OI growth & ask imbalance => TRUE BREAKOUT
+                 const meetsCvdBreakout = cvdDelta < -0.4;
+                 const meetsOiBreakout = oiDelta > -0.01;
+                 const meetsImbalanceBreakout = orderbookImbalance < -0.10;
+
+                 if (meetsCvdBreakout && meetsOiBreakout && meetsImbalanceBreakout) {
                     triggerEntrySide = 'SELL';
                     chosenStratType = 'BREAKOUT';
-                    signalMsg = `True Breakout confirmed at support ${nearestZone?.type || ''}. Speed Acceleration: ${tapeAcceleration.toFixed(1)}x. Strong selling CVD: ${cvdDelta.toFixed(2)}k. OI: $${openInterest.toFixed(1)}M.`;
+                    signalMsg = `True Breakdown confirmed at support ${nearestZone?.type || ''}. Speed Acceleration: ${tapeAcceleration.toFixed(1)}x. Strong selling CVD: ${cvdDelta.toFixed(2)}k. OI: +${oiDelta.toFixed(3)}M. Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids.`;
                  }
-                 // Option B: high transaction rate but positive/diverging selling => ABSORPTION FADE
-                 else if (cvdDelta > 0.2) {
-                    triggerEntrySide = 'BUY';
-                    chosenStratType = 'ABSORPTION_FADE';
-                    signalMsg = `Absorption Fade triggered at support ${nearestZone?.type || ''}. Fast sells absorbed by massive passive buy blocks. CVD: +${cvdDelta.toFixed(2)}k.`;
+                 // Option B: high transaction rate of sellers absorbed by passive limit buyers => ABSORPTION FADE
+                 else {
+                    const isExhaustionFade = cvdDelta > 0.2;
+                    const isActiveAbsorptionFade = cvdDelta < -0.2 && oiDelta > 0.01;
+                    const meetsImbalanceFade = orderbookImbalance > -0.25;
+
+                    if ((isExhaustionFade || isActiveAbsorptionFade) && meetsImbalanceFade) {
+                       triggerEntrySide = 'BUY';
+                       chosenStratType = 'ABSORPTION_FADE';
+                       signalMsg = `Absorption Fade triggered at support ${nearestZone?.type || ''}. ` +
+                         (isActiveAbsorptionFade 
+                            ? `Active Buyer Limit Absorption: Sellers dumped (CVD: ${cvdDelta.toFixed(2)}k) but support held firm. Fresh long OI accumulated: +${oiDelta.toFixed(3)}M.` 
+                            : `Aggressive Buyer Backing: Tape accelerated but CVD selling exhausted to buying (CVD Delta: +${cvdDelta.toFixed(2)}k).`) +
+                            ` Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids.`;
+                    }
                  }
               }
 

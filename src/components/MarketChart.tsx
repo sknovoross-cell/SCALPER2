@@ -608,21 +608,23 @@ export function MarketChart({
              {/* Pivot support/resistance and daily swing levels visual reference lines */}
             {resolvedZones.map((z, i) => {
               const isLtf = z.levelStrength === 'LTF';
+              const isBroken = z.isBroken;
               return (
                 <ReferenceLine 
                   key={`line-${i}`} 
                   y={z.price} 
-                  stroke={z.color} 
-                  strokeOpacity={isLtf ? 0.35 : 0.75} 
+                  stroke={isBroken ? "#475569" : z.color} 
+                  strokeOpacity={isBroken ? 0.2 : (isLtf ? 0.35 : 0.75)} 
                   strokeWidth={isLtf ? 1 : 1.5} 
-                  strokeDasharray={isLtf ? "2 3" : "5 2"}
+                  strokeDasharray={isBroken ? "1 5" : (isLtf ? "2 3" : "5 2")}
                 />
               );
             })}
 
             {resolvedZones.map((z, i) => {
               const isLtf = z.levelStrength === 'LTF';
-              const marker = isLtf ? 'LTF - Risk -50%' : 'HTF - Strong';
+              const isBroken = z.isBroken;
+              const marker = isBroken ? 'BROKEN / PASSIVE' : (isLtf ? 'LTF - Risk -50%' : 'HTF - Strong');
               return (
                 <ReferenceLine 
                   key={`lbl-${i}`} 
@@ -631,11 +633,11 @@ export function MarketChart({
                   label={{ 
                     position: z.position, 
                     value: `[${z.type}] ${z.price.toFixed(1)} (${marker})`, 
-                    fill: z.color, 
+                    fill: isBroken ? "#475569" : z.color, 
                     fontSize: isLtf ? 9 : 10, 
                     fontFamily: 'monospace', 
-                    fontWeight: isLtf ? 'normal' : 'bold',
-                    opacity: isLtf ? 0.65 : 1
+                    fontWeight: isBroken ? 'normal' : (isLtf ? 'normal' : 'bold'),
+                    opacity: isBroken ? 0.35 : (isLtf ? 0.65 : 1)
                   }} 
                 />
               );
