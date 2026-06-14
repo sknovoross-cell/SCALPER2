@@ -1,12 +1,14 @@
 import React from 'react';
 import { AppConfig } from '../types';
+import { Flame } from 'lucide-react';
 
 interface SettingsPanelProps {
   config: AppConfig;
   onChange: (c: Partial<AppConfig>) => void;
+  onOpenSelector: () => void;
 }
 
-export function SettingsPanel({ config, onChange }: SettingsPanelProps) {
+export function SettingsPanel({ config, onChange, onOpenSelector }: SettingsPanelProps) {
   return (
     <div className="w-80 border-r border-[#1a2233] bg-transparent p-4 overflow-y-auto flex flex-col gap-6 font-mono text-[11px] z-10">
       
@@ -24,10 +26,19 @@ export function SettingsPanel({ config, onChange }: SettingsPanelProps) {
                 <option value="live">⚡ LIVE (RISK)</option>
               </select>
             </label>
-            <label className="flex flex-col gap-1">
-              <span className="text-[#64748b]">Symbols</span>
-              <input type="text" className="bg-[#050608] border border-[#1a2233] rounded px-2 py-1 text-[#e0e0e0]" value={config.symbols} onChange={e => onChange({symbols: e.target.value})} />
-            </label>
+            <div className="flex flex-col gap-1 cursor-pointer group" onClick={onOpenSelector}>
+              <span className="text-[#64748b] flex justify-between items-center select-none">
+                <span>Symbols</span>
+                <span className="text-[9px] text-[#00ff41] font-bold uppercase tracking-wider group-hover:underline">Выбрать</span>
+              </span>
+              <div className="flex items-center justify-between bg-[#050608] border border-[#1a2233] group-hover:border-[#00ff41]/50 rounded px-3 py-1.5 text-[#e0e0e0] transition-colors">
+                <span className="font-bold flex items-center gap-1 text-[12px]">
+                  <Flame className="w-3.5 h-3.5 text-[#00ff41] animate-pulse" />
+                  {config.symbols || "BTCUSDT"}
+                </span>
+                <span className="text-[9px] text-[#475569] group-hover:text-[#38bdf8] font-bold">ОТКРЫТЬ SCANNER</span>
+              </div>
+            </div>
 
             <div className="border-t border-[#1a2232]/30 pt-3 space-y-3">
               <label className="flex flex-col gap-1">

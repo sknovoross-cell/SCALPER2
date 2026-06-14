@@ -6,7 +6,8 @@ import { SignalLog } from './components/SignalLog';
 import { MarketChart } from './components/MarketChart';
 import { PortfolioComponent } from './components/PortfolioComponent';
 import { useEngine } from './hooks/useEngine';
-import { Activity, LayoutDashboard, BarChart2, Briefcase, Terminal, X, Play, Pause } from 'lucide-react';
+import { Activity, LayoutDashboard, BarChart2, Briefcase, Terminal, X, Play, Pause, Flame } from 'lucide-react';
+import { SymbolSelectorModal } from './components/SymbolSelectorModal';
 
 export default function App() {
   const {
@@ -40,6 +41,7 @@ export default function App() {
   const [chartFullscreen, setChartFullscreen] = useState(false);
   const [logs, setLogs] = useState<{ time: string; level: string; message: string }[]>([]);
   const [showLogs, setShowLogs] = useState(false);
+  const [isSymbolSelectorOpen, setIsSymbolSelectorOpen] = useState(false);
 
   const currentPriceRaw = metrics.length > 0 ? metrics[metrics.length - 1].price : 64500;
   const currentPriceStr = formatPrice(currentPriceRaw);
@@ -92,10 +94,16 @@ export default function App() {
               </button>
             </div>
 
-            <div className="flex flex-col">
-              <span className="text-[10px] text-[#64748b] uppercase">Цена ({config.symbols || "BTCUSDT"})</span>
-              <span className="text-sm font-bold text-[#e0e0e0]">${currentPriceStr}</span>
-            </div>
+            <button
+              onClick={() => setIsSymbolSelectorOpen(true)}
+              className="group flex flex-col text-right hover:bg-white/5 p-1 px-2 rounded border border-transparent hover:border-[#1a2233] transition-all cursor-pointer"
+              title="Открыть сканер инструментов"
+            >
+              <span className="text-[10px] text-[#64748b] uppercase flex items-center gap-1 select-none">
+                Инструмент: <span className="text-[#00ff41] font-bold tracking-wider flex items-center gap-0.5"><Flame className="w-2.5 h-2.5 fill-current animate-pulse text-[#00ff41]" /> {config.symbols || "BTCUSDT"}</span>
+              </span>
+              <span className="text-sm font-bold text-[#e0e0e0] group-hover:text-[#00ff41] transition-colors tabular-nums">${currentPriceStr}</span>
+            </button>
             <div className="flex flex-col">
               <span className="text-[10px] text-[#64748b] uppercase">Задержка (Hot Path)</span>
               <span className="text-sm font-bold text-[#38bdf8]">{latency.toFixed(2)}ms <span className="text-[10px] opacity-50 text-[#38bdf8]">E2E</span></span>
@@ -138,7 +146,7 @@ export default function App() {
       <div className={`flex-1 flex min-h-0 w-full ${chartFullscreen ? 'max-w-none p-0 m-0' : 'container mx-auto max-w-[1400px]'}`}>
         
         {/* Left Sidebar: Controls & Settings */}
-        {!chartFullscreen && <SettingsPanel config={config} onChange={updateConfig} />}
+        {!chartFullscreen && <SettingsPanel config={config} onChange={updateConfig} onOpenSelector={() => setIsSymbolSelectorOpen(true)} />}
 
         {/* Center Area: Context Switching */}
         <main className={`flex-1 flex flex-col min-w-0 gap-4 z-10 overflow-y-auto ${chartFullscreen ? 'p-0' : 'p-4'}`}>
@@ -273,6 +281,14 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Symbol Selection Scan Drawer / Modal */}
+      <SymbolSelectorModal 
+        isOpen={isSymbolSelectorOpen} 
+        onClose={() => setIsSymbolSelectorOpen(false)} 
+        currentSymbol={config.symbols || "BTCUSDT"} 
+        onSelectSymbol={(sym) => updateConfig({ symbols: sym })} 
+      />
 
     </div>
   );

@@ -284,6 +284,65 @@ app.get("/api/oi", async (req, res) => {
   return res.status(502).json({ error: "Failed to load Open Interest data from all Binance mirrors." });
 });
 
+// Proxy route for 24-hour ticker stats to determine "In-Play" and High Volume coins
+app.get("/api/tickers24h", async (req, res) => {
+  const endpoints = [
+    "https://fapi.binanceapi.com/fapi/v1/ticker/24hr",
+    "https://fapi.binance.me/fapi/v1/ticker/24hr",
+    "https://fapi.binance.cc/fapi/v1/ticker/24hr",
+    "https://fapi.binance.com/fapi/v1/ticker/24hr",
+    "https://fstream.binance.com/fapi/v1/ticker/24hr"
+  ];
+
+  for (const url of endpoints) {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} from ${url}`);
+      }
+      const data = await response.json();
+      if (Array.isArray(data)) {
+        const formatted = data
+          .filter((t: any) => t.symbol && t.symbol.endsWith("USDT"))
+          .map((t: any) => {
+            const priceChangePercent = parseFloat(t.priceChangePercent) || 0;
+            const quoteVolume = parseFloat(t.quoteVolume) || 0;
+            const lastPrice = parseFloat(t.lastPrice) || 0;
+            const highPrice = parseFloat(t.highPrice) || 0;
+            const lowPrice = parseFloat(t.lowPrice) || 0;
+            
+            // "In-Play" (В игре) criteria: volatile momentum with significant price move AND trading liquidity
+            const isInPlay = Math.abs(priceChangePercent) >= 4.0 && quoteVolume >= 10000000;
+
+            return {
+              symbol: t.symbol,
+              priceChangePercent,
+              quoteVolume,
+              lastPrice,
+              highPrice,
+              lowPrice,
+              isInPlay
+            };
+          });
+
+        // Pre-sort overall lists (will be presented elegantly on front-end)
+        // Sort: In-Play first (by volume), then others (by volume)
+        formatted.sort((a, b) => {
+          if (a.isInPlay && !b.isInPlay) return -1;
+          if (!a.isInPlay && b.isInPlay) return 1;
+          return b.quoteVolume - a.quoteVolume;
+        });
+
+        return res.json(formatted);
+      }
+    } catch (err: any) {
+      console.warn(`[Server] Ticker list fetch failed on ${url}:`, err.message || err);
+    }
+  }
+
+  return res.status(502).json({ error: "Failed to load ticker list from Binance mirrors." });
+});
+
 // SSE endpoint to broadcast binance order book trades live with zero firewall restrictions
 app.get("/api/stream", (req, res) => {
   const reqSymbol = (req.query.symbol as string || "BTCUSDT").trim().toLowerCase();
