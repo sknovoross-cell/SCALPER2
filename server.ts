@@ -28,14 +28,17 @@ let binanceWs: WebSocketClient | null = null;
 let currentWsUrl = "";
 let lastWebSocketMessageTime = 0;
 let lastPolledPrice = 0;
+let activeSymbol = "btcusdt";
+let disconnectBinanceFeed: (() => void) | null = null;
 
 // Server-side subscriber to Binance Futures
-function connectBinance() {
+function connectBinance(symbol = "btcusdt") {
+  const symbolLower = symbol.toLowerCase().trim();
   const wsEndpoints = [
-    "wss://fstream.binanceapi.com/ws/btcusdt@aggTrade",
-    "wss://fstream.binance.me/ws/btcusdt@aggTrade",
-    "wss://fstream.binance.cc/ws/btcusdt@aggTrade",
-    "wss://fstream.binance.com/ws/btcusdt@aggTrade"
+    `wss://fstream.binanceapi.com/ws/${symbolLower}@aggTrade`,
+    `wss://fstream.binance.me/ws/${symbolLower}@aggTrade`,
+    `wss://fstream.binance.cc/ws/${symbolLower}@aggTrade`,
+    `wss://fstream.binance.com/ws/${symbolLower}@aggTrade`
   ];
   let endpointIndex = 0;
   let active = true;
@@ -68,7 +71,7 @@ function connectBinance() {
         if (connTimeout) clearTimeout(connTimeout);
         addLog("INFO", `Binance WebSocket connection successfully established to ${targetUrl}`);
         // Keep-alive notify on channel
-        broadcast({ type: "ws_status", status: "OK", url: targetUrl });
+        broadcast({ type: "ws_status", status: `OK [${symbol.toUpperCase()}]`, url: targetUrl });
       });
 
       binanceWs.on("message", (rawData) => {
@@ -123,11 +126,12 @@ async function pollFallbackPrice() {
     return;
   }
 
+  const symbolUpper = activeSymbol.toUpperCase();
   const endpoints = [
-    "https://fapi.binanceapi.com/fapi/v1/ticker/price?symbol=BTCUSDT",
-    "https://fapi.binance.me/fapi/v1/ticker/price?symbol=BTCUSDT",
-    "https://fapi.binance.cc/fapi/v1/ticker/price?symbol=BTCUSDT",
-    "https://fapi.binance.com/fapi/v1/ticker/price?symbol=BTCUSDT"
+    `https://fapi.binanceapi.com/fapi/v1/ticker/price?symbol=${symbolUpper}`,
+    `https://fapi.binance.me/fapi/v1/ticker/price?symbol=${symbolUpper}`,
+    `https://fapi.binance.cc/fapi/v1/ticker/price?symbol=${symbolUpper}`,
+    `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbolUpper}`
   ];
 
   for (const url of endpoints) {
@@ -141,7 +145,7 @@ async function pollFallbackPrice() {
             lastPolledPrice = price;
           }
           // Notify client we're using fallback polling
-          broadcast({ type: "ws_status", status: "OK [FALLBACK POLLED]", url: "REST API fallback" });
+          broadcast({ type: "ws_status", status: `OK [FALLBACK POLLED - ${symbolUpper}]`, url: "REST API fallback" });
 
           // Generate simulated active trade flow using the actual live spot/futures price
           const randomTradesCount = Math.floor(Math.random() * 5) + 2; // 2 to 6 simulated micro-trades
@@ -151,11 +155,17 @@ async function pollFallbackPrice() {
             const size = Math.random() * 0.4 + 0.01;
             const isMakerBuyer = Math.random() > 0.5;
 
+            // Determine formatting precision based on price scale
+            let precision = 2;
+            if (price < 1) precision = 6;
+            else if (price < 10) precision = 4;
+            else if (price < 500) precision = 3;
+
             const mockTrade = {
               e: "aggTrade",
               E: Date.now() - Math.floor(Math.random() * 300),
-              s: "BTCUSDT",
-              p: microPrice.toFixed(2),
+              s: symbolUpper,
+              p: microPrice.toFixed(precision),
               q: size.toFixed(3),
               m: isMakerBuyer,
               T: Date.now()
@@ -276,6 +286,17 @@ app.get("/api/oi", async (req, res) => {
 
 // SSE endpoint to broadcast binance order book trades live with zero firewall restrictions
 app.get("/api/stream", (req, res) => {
+  const reqSymbol = (req.query.symbol as string || "BTCUSDT").trim().toLowerCase();
+
+  if (reqSymbol && reqSymbol !== activeSymbol) {
+    addLog("INFO", `Stream requested symbol change from ${activeSymbol} to ${reqSymbol}`);
+    activeSymbol = reqSymbol;
+    if (disconnectBinanceFeed) {
+      disconnectBinanceFeed();
+    }
+    disconnectBinanceFeed = connectBinance(reqSymbol);
+  }
+
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
@@ -315,7 +336,7 @@ setInterval(() => {
 
 async function startServer() {
   // Fire up the background Binance WS client
-  const disconnectBinanceFeed = connectBinance();
+  disconnectBinanceFeed = connectBinance("btcusdt");
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -336,7 +357,9 @@ async function startServer() {
   });
 
   process.on("SIGTERM", () => {
-    disconnectBinanceFeed();
+    if (disconnectBinanceFeed) {
+      disconnectBinanceFeed();
+    }
     process.exit(0);
   });
 }

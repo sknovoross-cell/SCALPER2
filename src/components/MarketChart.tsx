@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, ReferenceDot, CartesianGrid } from 'recharts';
 import { ChartCandle, LiquidityZone, HistorisedTrade } from '../types';
 import { 
@@ -22,6 +22,7 @@ interface MarketChartProps {
   trades?: HistorisedTrade[];
   isFullscreen?: boolean;
   onFullscreenChange?: (isFullscreen: boolean) => void;
+  symbol?: string;
 }
 
 export function MarketChart({ 
@@ -31,8 +32,11 @@ export function MarketChart({
   setTimeframe, 
   trades = [],
   isFullscreen: controlledIsFullscreen,
-  onFullscreenChange
+  onFullscreenChange,
+  symbol = "BTCUSDT"
 }: MarketChartProps) {
+  const activeSymbolName = symbol.toUpperCase();
+  const baseAsset = activeSymbolName.replace("USDT", "").replace("BUSD", "");
   const [localIsFullscreen, setLocalIsFullscreen] = useState(false);
   
   const isFullscreen = controlledIsFullscreen !== undefined ? controlledIsFullscreen : localIsFullscreen;
@@ -62,6 +66,56 @@ export function MarketChart({
   const [yScaleBuffer, setYScaleBuffer] = useState(1.0);
   const [hoveredZone, setHoveredZone] = useState<{ cx: number; cy: number; zone: LiquidityZone } | null>(null);
   const [showSrDesk, setShowSrDesk] = useState(true);
+  const tooltipTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const [isDraggingY, setIsDraggingY] = useState(false);
+  const [isDraggingX, setIsDraggingX] = useState(false);
+  
+  const dragStartY = useRef<number>(0);
+  const dragStartX = useRef<number>(0);
+  const dragStartScaleY = useRef<number>(1.0);
+  const dragStartZoomX = useRef<number>(100);
+
+  // Use document event listeners during drag so movement is seamless even when mouse wanders off the axis strip.
+  useEffect(() => {
+    if (!isDraggingY && !isDraggingX) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (isDraggingY) {
+        const deltaY = e.clientY - dragStartY.current;
+        const newYScale = dragStartScaleY.current + (deltaY / 200);
+        setYScaleBuffer(Math.max(0.3, Math.min(3.5, newYScale)));
+      }
+      if (isDraggingX) {
+        const deltaX = e.clientX - dragStartX.current;
+        const zoomDelta = Math.round(deltaX / 5);
+        const newZoom = dragStartZoomX.current - zoomDelta;
+        setZoomCount(Math.max(20, Math.min(250, newZoom)));
+      }
+    };
+
+    const handleMouseUp = () => {
+      setIsDraggingY(false);
+      setIsDraggingX(false);
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isDraggingY, isDraggingX]);
+
+  // Cleanup timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (tooltipTimeoutRef.current) {
+        clearTimeout(tooltipTimeoutRef.current);
+      }
+    };
+  }, []);
 
   // Esc key listener for fullscreen exit
   useEffect(() => {
@@ -95,20 +149,34 @@ export function MarketChart({
   // Dynamic scale stretching: pull the nearest senior HTF support and resistance levels into the domain
   // so major HTF liquidity levels are clearly visible even on 1m, 5m or 15m charts!
   const currentPrice = visibleData.length > 0 ? visibleData[visibleData.length - 1].close : 64250;
+
+  // Format price helper according to currentPrice scale
+  const formatPrice = (val: number): string => {
+    if (currentPrice < 0.001) return val.toFixed(6);
+    if (currentPrice < 0.01) return val.toFixed(5);
+    if (currentPrice < 0.1) return val.toFixed(4);
+    if (currentPrice < 2) return val.toFixed(3);
+    if (currentPrice < 20) return val.toFixed(2);
+    if (currentPrice < 100) return val.toFixed(2);
+    if (currentPrice < 1000) return val.toFixed(1);
+    return val.toFixed(1);
+  };
+
   if (showZones && zones.length > 0) {
     const seniorZonesAbove = zones.filter(z => z.levelStrength === 'HTF' && z.price > currentPrice);
     const seniorZonesBelow = zones.filter(z => z.levelStrength === 'HTF' && z.price < currentPrice);
     
+    const htfPadding = currentPrice * 0.0005;
     if (seniorZonesAbove.length > 0) {
       const nearestAbove = Math.min(...seniorZonesAbove.map(z => z.price));
       if (nearestAbove - currentPrice < currentPrice * 0.035) { // within 3.5% range
-        dataMax = Math.max(dataMax, nearestAbove + 35);
+        dataMax = Math.max(dataMax, nearestAbove + htfPadding);
       }
     }
     if (seniorZonesBelow.length > 0) {
       const nearestBelow = Math.max(...seniorZonesBelow.map(z => z.price));
       if (currentPrice - nearestBelow < currentPrice * 0.035) { // within 3.5% range
-        dataMin = Math.min(dataMin, nearestBelow - 35);
+        dataMin = Math.min(dataMin, nearestBelow - htfPadding);
       }
     }
   }
@@ -116,9 +184,9 @@ export function MarketChart({
   // Dynamic Y-axis margins (padding) based on total scale of the active chart timeframe to prevent
   // lines and labels at the absolute top/bottom extremes from clashing with borders or time axis/ticks.
   const rangeY = dataMax - dataMin;
-  const baseBuffer = Math.max(80, rangeY * 0.08);
+  const baseBuffer = Math.max(currentPrice * 0.001, rangeY * 0.08);
   const bufferY = baseBuffer * yScaleBuffer;
-  const minDomain = dataMin - bufferY;
+  const minDomain = Math.max(0, dataMin - bufferY);
   const maxDomain = dataMax + bufferY;
 
   // Filter zones that are relevant to the selected timeframe.
@@ -234,8 +302,21 @@ export function MarketChart({
     // We render the dot slightly shifted to the left edge of the chart (cx is the chart area's coordinate)
     return (
       <g
-        onMouseEnter={() => setHoveredZone({ cx, cy, zone })}
-        onMouseLeave={() => setHoveredZone(null)}
+        onMouseEnter={() => {
+          if (tooltipTimeoutRef.current) {
+            clearTimeout(tooltipTimeoutRef.current);
+            tooltipTimeoutRef.current = null;
+          }
+          setHoveredZone({ cx, cy, zone });
+        }}
+        onMouseLeave={() => {
+          if (tooltipTimeoutRef.current) {
+            clearTimeout(tooltipTimeoutRef.current);
+          }
+          tooltipTimeoutRef.current = setTimeout(() => {
+            setHoveredZone(null);
+          }, 5000);
+        }}
         className="cursor-pointer font-sans"
       >
         <circle
@@ -275,7 +356,7 @@ export function MarketChart({
         <div>
           <h2 className="text-[11px] font-bold text-[#64748b] uppercase mb-0.5 tracking-wider flex items-center gap-1.5">
             <span className="w-2 h-2 rounded-full bg-[#38bdf8] animate-pulse"></span>
-            Карта Ликвидности (Real-time {timeframe.toUpperCase()} BTCUSDT)
+            Карта Ликвидности (Real-time {timeframe.toUpperCase()} {activeSymbolName})
           </h2>
           <p className="text-[9px] text-[#38bdf8] opacity-80 uppercase tracking-widest">
             Live Binance Futures Feed + HTF Key Pivot Level Mapping
@@ -444,7 +525,21 @@ export function MarketChart({
       {/* Absolute Validation Hover Card */}
       {hoveredZone && (
         <div 
-          className="absolute z-50 bg-[#070b14]/95 border border-[#1a2233] p-3 rounded shadow-2xl w-72 text-[10px] pointer-events-none transition-all duration-150 backdrop-blur-md"
+          className="absolute z-50 bg-[#070b14]/95 border border-[#1a2233] p-3 rounded shadow-2xl w-72 text-[10px] pointer-events-auto transition-all duration-150 backdrop-blur-md"
+          onMouseEnter={() => {
+            if (tooltipTimeoutRef.current) {
+              clearTimeout(tooltipTimeoutRef.current);
+              tooltipTimeoutRef.current = null;
+            }
+          }}
+          onMouseLeave={() => {
+            if (tooltipTimeoutRef.current) {
+              clearTimeout(tooltipTimeoutRef.current);
+            }
+            tooltipTimeoutRef.current = setTimeout(() => {
+              setHoveredZone(null);
+            }, 5000);
+          }}
           style={{ 
             left: `${hoveredZone.cx + 20}px`, 
             top: `${Math.max(10, hoveredZone.cy - 50)}px` 
@@ -460,7 +555,7 @@ export function MarketChart({
           
           {/* Price & Updated Time */}
           <div className="flex justify-between text-[10px] mb-2 font-mono items-center">
-            <span className="text-[#38bdf8] font-bold">${hoveredZone.zone.price.toFixed(1)}</span>
+            <span className="text-[#38bdf8] font-bold">${formatPrice(hoveredZone.zone.price)}</span>
             <span className="text-[#64748b] flex items-center gap-1">
               <span className="w-1.5 h-1.5 rounded-full bg-[#00ff41] inline-block animate-ping"></span>
               Обновлено: {hoveredZone.zone.updatedAt || 'н/д'}
@@ -553,9 +648,57 @@ export function MarketChart({
       {/* Main Chart Canvas & S/R Desk combined flex container */}
       <div className="flex flex-1 min-h-0 w-full gap-4 flex-col lg:flex-row relative">
         {/* Main Chart Canvas Area */}
-        <div className="flex-1 min-h-[350px] relative">
-        <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={visibleData} margin={{ top: 15, right: 5, left: 15, bottom: 0 }}>
+        <div className="flex-1 min-h-[350px] relative group/chart">
+          
+          {/* TradingView-style Interactive Scales Overlay */}
+          {/* Y-Axis scale slider overlay (over right-hand 60px strip of the chart component) */}
+          <div 
+            className={`absolute right-0 top-[15px] bottom-[30px] w-[60px] cursor-ns-resize select-none z-30 flex flex-col justify-center items-center transition-all duration-150 rounded-r border-l border-transparent hover:border-gray-500/20 active:border-[#38bdf8]/40 hover:bg-white/[0.02] active:bg-[#38bdf8]/[0.02] ${isDraggingY ? 'bg-[#38bdf8]/[0.04] border-[#38bdf8]/35' : ''}`}
+            onMouseDown={(e) => {
+              if (e.button !== 0) return; // Left click only
+              setIsDraggingY(true);
+              dragStartY.current = e.clientY;
+              dragStartScaleY.current = yScaleBuffer;
+              e.preventDefault();
+            }}
+            onDoubleClick={() => {
+              setYScaleBuffer(1.0);
+            }}
+            title="Перетащите вверх/вниз для вертикального масштабирования (Y-Axis). Дважды кликните для сброса."
+          >
+            {/* Double headed arrow active indicator */}
+            <div className={`text-[9px] font-mono font-bold transition-opacity duration-200 select-none flex flex-col items-center gap-0.5 pointer-events-none ${isDraggingY ? 'text-[#38bdf8] opacity-100' : 'text-gray-500 opacity-0 group-hover/chart:opacity-60'}`}>
+              <span>▲</span>
+              <span className="text-[7px] leading-none">Y</span>
+              <span>▼</span>
+            </div>
+          </div>
+
+          {/* X-Axis scale slider overlay (over bottom 30px strip, keeping 60px right margin) */}
+          <div 
+            className={`absolute left-[15px] right-[60px] bottom-0 h-[30px] cursor-ew-resize select-none z-30 flex justify-center items-center transition-all duration-150 rounded-b border-t border-transparent hover:border-gray-500/20 active:border-[#38bdf8]/40 hover:bg-white/[0.02] active:bg-[#38bdf8]/[0.02] ${isDraggingX ? 'bg-[#38bdf8]/[0.04] border-[#38bdf8]/35' : ''}`}
+            onMouseDown={(e) => {
+              if (e.button !== 0) return; // Left click only
+              setIsDraggingX(true);
+              dragStartX.current = e.clientX;
+              dragStartZoomX.current = zoomCount;
+              e.preventDefault();
+            }}
+            onDoubleClick={() => {
+              setZoomCount(100);
+            }}
+            title="Перетащите влево/вправо для временного масштабирования (X-Axis). Дважды кликните для сброса."
+          >
+            {/* Horizontal arrow active indicator */}
+            <div className={`text-[9px] font-mono font-bold transition-opacity duration-200 select-none flex items-center gap-1.5 pointer-events-none ${isDraggingX ? 'text-[#38bdf8] opacity-100' : 'text-gray-500 opacity-0 group-hover/chart:opacity-60'}`}>
+              <span>◀</span>
+              <span className="text-[7px]">X</span>
+              <span>▶</span>
+            </div>
+          </div>
+
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={visibleData} margin={{ top: 15, right: 5, left: 15, bottom: 0 }}>
             <defs>
               <linearGradient id="colorClose" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="5%" stopColor="#38bdf8" stopOpacity={0.4}/>
@@ -586,7 +729,7 @@ export function MarketChart({
               stroke="#1a2233" 
               tick={{fill: '#64748b', fontSize: 10, fontFamily: 'monospace'}} 
               orientation="right" 
-              tickFormatter={(val) => val.toFixed(1)} 
+              tickFormatter={formatPrice} 
               tickLine={false}
               axisLine={{stroke: '#1a2233'}}
             />
@@ -594,6 +737,7 @@ export function MarketChart({
               contentStyle={{ backgroundColor: '#050608', borderColor: '#1a2233', fontSize: '11px', fontFamily: 'monospace' }} 
               itemStyle={{ color: '#38bdf8' }} 
               labelStyle={{ color: '#64748b', marginBottom: '4px' }}
+              formatter={(val: any) => [formatPrice(Number(val)), "Price"]}
             />
             <Area 
               type="stepAfter" 
@@ -632,7 +776,7 @@ export function MarketChart({
                   stroke="none" 
                   label={{ 
                     position: z.position, 
-                    value: `[${z.type}] ${z.price.toFixed(1)} (${marker})`, 
+                    value: `[${z.type}] ${formatPrice(z.price)} (${marker})`, 
                     fill: isBroken ? "#475569" : z.color, 
                     fontSize: isLtf ? 9 : 10, 
                     fontFamily: 'monospace', 
@@ -741,7 +885,7 @@ export function MarketChart({
 
                       <div className="grid grid-cols-3 gap-1 pt-1.5 text-[8px] uppercase tracking-normal border-t border-[#1a2233]/40 text-gray-400 font-sans font-medium">
                         <div>
-                          <span className="text-[#64748b] text-[8px]">Vol (BTC):</span>
+                          <span className="text-[#64748b] text-[8px]">Vol ({baseAsset}):</span>
                           <div className="text-gray-300 font-bold mt-0.5">{(z.volumeScore || 0).toLocaleString('ru-RU', { maximumFractionDigits: 0 })}</div>
                         </div>
                         <div>

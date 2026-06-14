@@ -12,6 +12,9 @@ interface PortfolioComponentProps {
   tradedVolumeBtc: number;
   tradedVolumeUsd: number;
   completedTradesCount: number;
+  symbol?: string;
+  formatPrice?: (price: number) => string;
+  formatQty?: (price: number, qty: number) => string;
 }
 
 export function PortfolioComponent({
@@ -24,8 +27,16 @@ export function PortfolioComponent({
   feesPaid,
   tradedVolumeBtc,
   tradedVolumeUsd,
-  completedTradesCount
+  completedTradesCount,
+  symbol = "BTCUSDT",
+  formatPrice,
+  formatQty
 }: PortfolioComponentProps) {
+  const activeSymbolName = symbol.toUpperCase();
+  const baseAsset = activeSymbolName.replace("USDT", "").replace("BUSD", "");
+  
+  const fmtPrice = formatPrice || ((p: number) => (p === undefined || p === null || isNaN(p)) ? "0.0" : p.toFixed(2));
+  const fmtQty = formatQty || ((p: number, q: number) => (q === undefined || q === null || isNaN(q)) ? "0.0" : q.toFixed(4));
   // Compute absolute TP & SL levels with dynamic or static presets
   let tpPrice = position?.tpPrice;
   let slPrice = position?.slPrice;
@@ -34,12 +45,12 @@ export function PortfolioComponent({
     const tf = position.timeframe || '1m';
     const strat = position.strategyType || 'BREAKOUT';
     const TF_TARGETS_STATIC: Record<string, Record<string, { tp: number; sl: number }>> = {
-      '1m': { BREAKOUT: { tp: 120.0, sl: 40.0 }, ABSORPTION_FADE: { tp: 80.0, sl: 50.0 } },
-      '5m': { BREAKOUT: { tp: 250.0, sl: 80.0 }, ABSORPTION_FADE: { tp: 160.0, sl: 100.0 } },
-      '15m': { BREAKOUT: { tp: 450.0, sl: 150.0 }, ABSORPTION_FADE: { tp: 300.0, sl: 180.0 } },
-      '1h': { BREAKOUT: { tp: 900.0, sl: 300.0 }, ABSORPTION_FADE: { tp: 600.0, sl: 350.0 } },
-      '4h': { BREAKOUT: { tp: 1800.0, sl: 600.0 }, ABSORPTION_FADE: { tp: 1200.0, sl: 700.0 } },
-      '1d': { BREAKOUT: { tp: 4000.0, sl: 1500.0 }, ABSORPTION_FADE: { tp: 2500.0, sl: 1800.0 } }
+      '1m': { BREAKOUT: { tp: 120.0, sl: 40.0 }, ABSORPTION_FADE: { tp: 80.0, sl: 50.0 }, FALSE_BREAKOUT: { tp: 90.0, sl: 45.0 } },
+      '5m': { BREAKOUT: { tp: 250.0, sl: 80.0 }, ABSORPTION_FADE: { tp: 160.0, sl: 100.0 }, FALSE_BREAKOUT: { tp: 180.0, sl: 90.0 } },
+      '15m': { BREAKOUT: { tp: 450.0, sl: 150.0 }, ABSORPTION_FADE: { tp: 300.0, sl: 180.0 }, FALSE_BREAKOUT: { tp: 350.0, sl: 160.0 } },
+      '1h': { BREAKOUT: { tp: 900.0, sl: 300.0 }, ABSORPTION_FADE: { tp: 600.0, sl: 350.0 }, FALSE_BREAKOUT: { tp: 700.0, sl: 320.0 } },
+      '4h': { BREAKOUT: { tp: 1800.0, sl: 600.0 }, ABSORPTION_FADE: { tp: 1200.0, sl: 700.0 }, FALSE_BREAKOUT: { tp: 1400.0, sl: 650.0 } },
+      '1d': { BREAKOUT: { tp: 4000.0, sl: 1500.0 }, ABSORPTION_FADE: { tp: 2500.0, sl: 1800.0 }, FALSE_BREAKOUT: { tp: 3000.0, sl: 1600.0 } }
     };
     const target = TF_TARGETS_STATIC[tf]?.[strat] || TF_TARGETS_STATIC['1m']['BREAKOUT'];
     if (position.side === 'BUY') {
@@ -98,11 +109,11 @@ export function PortfolioComponent({
         <div className="bg-[#0a0f1d]/85 border border-[#1a2233] p-4 rounded-lg flex items-center justify-between">
           <div>
             <p className="text-[10px] text-[#64748b] uppercase tracking-wider">Current Mark Price</p>
-            <p className="text-xl font-mono font-bold text-[#fafafa] mt-1">${currentPrice.toFixed(2)}</p>
+            <p className="text-xl font-mono font-bold text-[#fafafa] mt-1">${fmtPrice(currentPrice)}</p>
           </div>
           <div className="text-right text-[10px] text-[#64748b]">
             <span className="inline-block w-2 h-2 bg-[#00ff41] rounded-full animate-ping mr-1"></span>
-            BTCUSDT Live
+            {activeSymbolName} Live
           </div>
         </div>
       </div>
@@ -128,8 +139,8 @@ export function PortfolioComponent({
               </div>
 
               <div className="flex justify-between items-center p-2.5 bg-black/20 rounded border border-[#1a2233]">
-                <span className="text-[10px] text-[#64748b] uppercase">Проторгованный объем BTC</span>
-                <span className="text-xs font-bold text-[#38bdf8]">{tradedVolumeBtc.toFixed(4)} BTC</span>
+                <span className="text-[10px] text-[#64748b] uppercase">Проторгованный объем {baseAsset}</span>
+                <span className="text-xs font-bold text-[#38bdf8]">{fmtQty(currentPrice, tradedVolumeBtc)} {baseAsset}</span>
               </div>
 
               <div className="flex justify-between items-center p-2.5 bg-black/20 rounded border border-[#1a2233]">
@@ -169,7 +180,7 @@ export function PortfolioComponent({
                   <div>
                      <p className="text-[10px] text-[#64748b] uppercase">Контракт / Сторона</p>
                      <p className="text-sm font-bold flex items-center gap-1 mt-0.5">
-                       BTCUSDT Perpetual 
+                       {activeSymbolName} Perpetual 
                        <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${position.side === 'BUY' ? 'bg-emerald-500/10 border border-emerald-500/20 text-[#00ff41]' : 'bg-red-500/10 border border-red-500/20 text-red-400'}`}>
                          {position.side === 'BUY' ? 'LONG' : 'SHORT'}
                        </span>
@@ -177,14 +188,14 @@ export function PortfolioComponent({
                   </div>
                   <div>
                      <p className="text-[10px] text-[#64748b] uppercase">Размер Позиции</p>
-                     <p className="text-sm font-mono font-bold text-[#e0e0e0] mt-0.5">{position.size} BTC (${(position.size * currentPrice).toLocaleString('en-US', {maximumFractionDigits: 0})})</p>
+                     <p className="text-sm font-mono font-bold text-[#e0e0e0] mt-0.5">{fmtQty(currentPrice, position.size)} {baseAsset} (${(position.size * currentPrice).toLocaleString('en-US', {maximumFractionDigits: 2})})</p>
                   </div>
                </div>
 
                <div className="grid grid-cols-2 gap-4 pt-3 pb-3">
                   <div>
                      <p className="text-[10px] text-[#64748b] uppercase">Цена Входа (Avg Entry)</p>
-                     <p className="text-sm font-mono font-bold text-[#e0e0e0] mt-0.5">${position.entryPrice.toFixed(2)}</p>
+                     <p className="text-sm font-mono font-bold text-[#e0e0e0] mt-0.5">${fmtPrice(position.entryPrice)}</p>
                   </div>
                   <div>
                      <p className="text-[10px] text-[#64748b] uppercase">Маржа (10x Leverage)</p>
@@ -198,14 +209,38 @@ export function PortfolioComponent({
                         <span className="w-1.5 h-1.5 rounded-full bg-[#00ff41]"></span>
                         Тейк-Профит (Take Profit)
                      </p>
-                     <p className="text-sm font-mono font-bold text-[#00ff41] mt-0.5">${tpPrice?.toFixed(2)}</p>
+                     <p className="text-sm font-mono font-bold text-[#00ff41] mt-0.5">${tpPrice ? fmtPrice(tpPrice) : ""}</p>
                   </div>
                   <div>
                      <p className="text-[10px] text-[#64748b] uppercase flex items-center gap-1">
                         <span className="w-1.5 h-1.5 rounded-full bg-red-500"></span>
                         Стоп-Лосс (Stop Loss)
                      </p>
-                     <p className="text-sm font-mono font-bold text-red-400 mt-0.5">${slPrice?.toFixed(2)}</p>
+                     <p className="text-sm font-mono font-bold text-red-400 mt-0.5">${slPrice ? fmtPrice(slPrice) : ""}</p>
+                  </div>
+               </div>
+
+               {/* Real-time cumulative adverse pressure tracking */}
+               <div className="mt-2 mb-3 bg-[#0a0f1d]/50 p-2.5 rounded border border-[#1a2233]/70 font-mono text-[10px]">
+                  <div className="flex justify-between items-center text-[#64748b] mb-1.5 uppercase tracking-wider">
+                    <span>Накоп. CVD сделки (CVD delta)</span>
+                    <span className={`font-bold ${position.positionCvd !== undefined && position.positionCvd >= 0 ? 'text-[#00ff41]' : 'text-red-400'}`}>
+                      {position.positionCvd !== undefined && position.positionCvd >= 0 ? '+' : ''}{(position.positionCvd || 0).toFixed(2)}k {baseAsset}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center text-[#64748b] uppercase tracking-wider">
+                    <span>Давление Против Позиции (Adverse Energy)</span>
+                    <span className={`font-bold ${position.adverseEnergy !== undefined && position.adverseEnergy > (slPrice ? Math.abs(position.entryPrice - slPrice) * 1.5 : 180) ? 'text-amber-400' : 'text-gray-400'}`}>
+                      {(position.adverseEnergy || 0).toFixed(1)} / {((slPrice ? Math.abs(position.entryPrice - slPrice) * 4.5 : 180)).toFixed(1)}
+                    </span>
+                  </div>
+                  <div className="w-full bg-[#111827] h-1.5 rounded-full overflow-hidden mt-1.5 border border-[#1a2233]">
+                    <div 
+                      className={`h-full transition-all duration-300 ${position.adverseEnergy !== undefined && position.adverseEnergy > (slPrice ? Math.abs(position.entryPrice - slPrice) * 2.25 : 90) ? 'bg-red-500' : 'bg-amber-500'}`}
+                      style={{ 
+                        width: `${Math.min(100, ((position.adverseEnergy || 0) / (slPrice ? Math.abs(position.entryPrice - slPrice) * 4.5 : 180)) * 100)}%` 
+                       }}
+                    />
                   </div>
                </div>
 
@@ -271,8 +306,8 @@ export function PortfolioComponent({
                            {t.side}
                         </span>
                       </td>
-                      <td className="py-2.5 px-3 text-white">${t.price.toFixed(2)}</td>
-                      <td className="py-2.5 px-3 uppercase text-[#64748b]">{t.size} BTC</td>
+                      <td className="py-2.5 px-3 text-white">${fmtPrice(t.price)}</td>
+                      <td className="py-2.5 px-3 uppercase text-[#64748b]">{fmtQty(t.price, t.size)} {baseAsset}</td>
                       <td className={`py-2.5 px-3 text-right font-bold ${t.pnl !== undefined ? (t.pnl >= 0 ? 'text-[#00ff41]' : 'text-red-500') : 'text-[#64748b]'}`}>
                          {t.pnl !== undefined ? `${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)}` : 'Entry Fill'}
                       </td>

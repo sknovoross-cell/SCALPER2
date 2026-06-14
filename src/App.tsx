@@ -31,7 +31,9 @@ export default function App() {
     feesPaid,
     tradedVolumeBtc,
     tradedVolumeUsd,
-    completedTradesCount
+    completedTradesCount,
+    formatPrice,
+    formatQty
   } = useEngine();
 
   const [view, setView] = useState<'dashboard' | 'chart' | 'portfolio'>('dashboard');
@@ -40,7 +42,7 @@ export default function App() {
   const [showLogs, setShowLogs] = useState(false);
 
   const currentPriceRaw = metrics.length > 0 ? metrics[metrics.length - 1].price : 64500;
-  const currentPriceStr = currentPriceRaw.toFixed(2);
+  const currentPriceStr = formatPrice(currentPriceRaw);
 
   useEffect(() => {
     let active = true;
@@ -91,7 +93,7 @@ export default function App() {
             </div>
 
             <div className="flex flex-col">
-              <span className="text-[10px] text-[#64748b] uppercase">Цена (BTCUSDT)</span>
+              <span className="text-[10px] text-[#64748b] uppercase">Цена ({config.symbols || "BTCUSDT"})</span>
               <span className="text-sm font-bold text-[#e0e0e0]">${currentPriceStr}</span>
             </div>
             <div className="flex flex-col">
@@ -195,7 +197,7 @@ export default function App() {
                timeframe={timeframe} 
                setTimeframe={setTimeframe} 
                isFullscreen={chartFullscreen}
-               onFullscreenChange={setChartFullscreen}
+               onFullscreenChange={setChartFullscreen} symbol={config.symbols}
              />
            )}
 
@@ -210,7 +212,7 @@ export default function App() {
                feesPaid={feesPaid}
                tradedVolumeBtc={tradedVolumeBtc}
                tradedVolumeUsd={tradedVolumeUsd}
-               completedTradesCount={completedTradesCount}
+               completedTradesCount={completedTradesCount} symbol={config.symbols} formatPrice={formatPrice} formatQty={formatQty}
              />
            )}
            

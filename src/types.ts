@@ -23,6 +23,7 @@ export interface LiquidityZone {
   oiScore?: number;
   touchesCount?: number;
   isBroken?: boolean;
+  hasBeenCrossed?: boolean;
   lastTouchTimestamp?: number;
 }
 
@@ -34,12 +35,15 @@ export interface TradePosition {
   unrealizedPnLPct: number;
   timestamp: string;
   createdAt?: number;
-  strategyType?: 'BREAKOUT' | 'ABSORPTION_FADE';
+  strategyType?: 'BREAKOUT' | 'ABSORPTION_FADE' | 'FALSE_BREAKOUT';
   timeframe?: string;
   tpPrice?: number;
   slPrice?: number;
   maxFavPrice?: number;
   hasPartialTP?: boolean;
+  positionCvd?: number;
+  adverseTicksCount?: number;
+  adverseEnergy?: number;
 }
 
 export interface HistorisedTrade {
@@ -50,7 +54,7 @@ export interface HistorisedTrade {
   price: number;
   size: number;
   pnl?: number;
-  strategyType?: 'BREAKOUT' | 'ABSORPTION_FADE';
+  strategyType?: 'BREAKOUT' | 'ABSORPTION_FADE' | 'FALSE_BREAKOUT';
 }
 
 export interface AppConfig {
@@ -58,6 +62,7 @@ export interface AppConfig {
   symbols: string;
   mode: 'paper' | 'live';
   latencyBudget: number;
+  paperBalance: number;
   risk: {
     maxDailyDDPct: number;
     maxPositionPct: number;
@@ -85,6 +90,10 @@ export interface AppConfig {
     signalExitEnabled: boolean;
     feeExitEnabled: boolean;
     predictiveLiqEnabled: boolean;
+    preciseEntryEnabled: boolean;
+    leverage: number;
+    tradeAmountUsd: number;
+    reduceSizeOnLtf: boolean;
   };
 }
 
@@ -111,7 +120,7 @@ export interface MicroMetrics {
 export interface SignalEvent {
   id: string;
   timestamp: string;
-  type: 'TRUE_BREAKOUT' | 'ABSORPTION_FADE' | 'SYSTEM_ALERT';
+  type: 'TRUE_BREAKOUT' | 'ABSORPTION_FADE' | 'FALSE_BREAKOUT' | 'SYSTEM_ALERT';
   side: 'BUY' | 'SELL' | 'NONE';
   price: number;
   message: string;

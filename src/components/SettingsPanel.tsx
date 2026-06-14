@@ -29,6 +29,55 @@ export function SettingsPanel({ config, onChange }: SettingsPanelProps) {
               <input type="text" className="bg-[#050608] border border-[#1a2233] rounded px-2 py-1 text-[#e0e0e0]" value={config.symbols} onChange={e => onChange({symbols: e.target.value})} />
             </label>
 
+            <div className="border-t border-[#1a2232]/30 pt-3 space-y-3">
+              <label className="flex flex-col gap-1">
+                <span className="text-[#64748b]">Paper Balance ($) / Баланс бумажного режима</span>
+                <input 
+                  type="number" 
+                  step="500" 
+                  min="100" 
+                  className="bg-[#050608] border border-[#1a2233] rounded px-2 py-1 text-[#e0e0e0] outline-none focus:border-[#38bdf8] transition-colors" 
+                  value={config.paperBalance ?? 12450} 
+                  onChange={e => onChange({ paperBalance: parseFloat(e.target.value) || 0 })} 
+                />
+              </label>
+
+              <label className="flex flex-col gap-1">
+                <span className="text-[#64748b]">Leverage / Плечо (x)</span>
+                <input 
+                  type="number" 
+                  step="1" 
+                  min="1" 
+                  max="125" 
+                  className="bg-[#050608] border border-[#1a2233] rounded px-2 py-1 text-[#e0e0e0] outline-none focus:border-[#38bdf8] transition-colors" 
+                  value={config.execution.leverage ?? 20} 
+                  onChange={e => onChange({ execution: { ...config.execution, leverage: parseInt(e.target.value) || 1 } })} 
+                />
+              </label>
+
+              <label className="flex flex-col gap-1">
+                <span className="text-[#38bdf8] font-bold">Trade Margin / Сумма в сделку ($)</span>
+                <input 
+                  type="number" 
+                  step="50" 
+                  min="10" 
+                  className="bg-[#050608] border border-[#38bdf8]/30 hover:border-[#38bdf8]/50 rounded px-2 py-1 text-[#38bdf8] outline-none focus:border-[#38bdf8] transition-colors font-bold" 
+                  value={config.execution.tradeAmountUsd ?? 1000} 
+                  onChange={e => onChange({ execution: { ...config.execution, tradeAmountUsd: parseFloat(e.target.value) || 10 } })} 
+                />
+              </label>
+
+              <label className="flex items-center justify-between cursor-pointer select-none py-1 border-b border-[#1a2232]/30 pb-2">
+                <span className="text-[#ef4444]/80">Reduce sum by 50% on LTF levels</span>
+                <input 
+                  type="checkbox" 
+                  className="w-3.5 h-3.5 accent-[#ef4444] cursor-pointer" 
+                  checked={config.execution.reduceSizeOnLtf !== false} 
+                  onChange={e => onChange({ execution: { ...config.execution, reduceSizeOnLtf: e.target.checked } })} 
+                />
+              </label>
+            </div>
+
             <div className="border-t border-[#1a2232]/50 pt-3 mt-3">
               <span className="text-[#64748b] font-bold block mb-2 tracking-wider">ACTIVE MANAGEMENT</span>
               <div className="space-y-2">
@@ -95,6 +144,17 @@ export function SettingsPanel({ config, onChange }: SettingsPanelProps) {
                      checked={config.execution.predictiveLiqEnabled} 
                      onChange={e => onChange({
                        execution: { ...config.execution, predictiveLiqEnabled: e.target.checked }
+                     })} 
+                   />
+                 </label>
+                 <label className="flex items-center justify-between cursor-pointer select-none border-t border-[#1a2232]/50 pt-2 mt-1">
+                   <span className="text-[#14b8a6] font-semibold">Precise Entry Mode (Точный вход)</span>
+                   <input 
+                     type="checkbox" 
+                     className="w-3.5 h-3.5 accent-[#14b8a6] cursor-pointer" 
+                     checked={config.execution.preciseEntryEnabled} 
+                     onChange={e => onChange({
+                       execution: { ...config.execution, preciseEntryEnabled: e.target.checked }
                      })} 
                    />
                  </label>
