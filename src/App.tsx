@@ -34,7 +34,8 @@ export default function App() {
     tradedVolumeUsd,
     completedTradesCount,
     formatPrice,
-    formatQty
+    formatQty,
+    warmupSecondsLeft
   } = useEngine();
 
   const [view, setView] = useState<'dashboard' | 'chart' | 'portfolio'>('dashboard');
@@ -110,7 +111,11 @@ export default function App() {
             </div>
             <div className="flex flex-col">
               <span className="text-[10px] text-[#64748b] uppercase">Статус Системы</span>
-              <span className={`text-sm font-bold ${halted ? 'text-[#ef4444]' : 'text-emerald-400'}`}>{halted ? 'HALTED' : state}</span>
+              {!halted && warmupSecondsLeft > 0 ? (
+                <span className="text-sm font-bold text-[#f59e0b] animate-pulse">WARM-UP ({warmupSecondsLeft}s)</span>
+              ) : (
+                <span className={`text-sm font-bold ${halted ? 'text-[#ef4444]' : 'text-emerald-400'}`}>{halted ? 'HALTED' : state}</span>
+              )}
             </div>
             <div className="flex items-center gap-2">
               <button 
@@ -153,6 +158,25 @@ export default function App() {
            
            {view === 'dashboard' && (
              <>
+               {!halted && warmupSecondsLeft > 0 && (
+                 <div className="bg-[#f59e0b]/5 border border-[#f59e0b]/30 rounded-lg p-3 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs text-[#f59e0b] shadow-[0_0_12px_rgba(245,158,11,0.05)] animate-pulse shrink-0">
+                   <div className="flex items-start sm:items-center gap-3">
+                     <div className="relative flex h-3.5 w-3.5 mt-0.5 sm:mt-0 shrink-0">
+                       <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#f59e0b] opacity-75"></span>
+                       <span className="relative inline-flex rounded-full h-3.5 w-3.5 bg-[#f59e0b]"></span>
+                     </div>
+                     <div>
+                       <p className="font-bold tracking-tight uppercase text-white">ПЕРИОД КАЛИБРОВКИ СТАТИСТИКИ (WARM-UP PHASE)</p>
+                       <p className="text-[10px] text-[#f59e0b]/90 leading-relaxed font-mono">Сбор торговой активности агрегированных сделок и калибровка стандартного отклонения (Z-Score) для предотвращения ложных входов...</p>
+                     </div>
+                   </div>
+                   <div className="text-left sm:text-right shrink-0 bg-black/40 border border-[#f59e0b]/20 px-3 py-1 rounded">
+                     <p className="text-[9px] uppercase text-[#64748b]">ОСТАЛОСЬ</p>
+                     <p className="text-sm font-bold font-mono tracking-widest text-white">{warmupSecondsLeft}с</p>
+                   </div>
+                 </div>
+               )}
+
                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                  <div className="bg-[#0a0f1d]/80 border border-[#1a2233] rounded-lg p-4 h-64 font-mono">
                    <h2 className="text-[11px] font-bold text-[#64748b] uppercase mb-4 tracking-wider">Конечный автомат (FSM) Context</h2>
@@ -216,7 +240,7 @@ export default function App() {
                accountEquity={accountEquity}
                realizedPnL={realizedPnL}
                currentPrice={currentPriceRaw}
-               onClosePosition={closePosition}
+               onClosePosition={closePosition} zones={zones}
                feesPaid={feesPaid}
                tradedVolumeBtc={tradedVolumeBtc}
                tradedVolumeUsd={tradedVolumeUsd}

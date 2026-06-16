@@ -1,4 +1,4 @@
-import { TradePosition, HistorisedTrade } from '../types';
+import { TradePosition, HistorisedTrade, LiquidityZone } from '../types';
 import { ArrowUpRight, ArrowDownRight, TrendingUp, ShieldAlert, Zap, History, DollarSign } from 'lucide-react';
 
 interface PortfolioComponentProps {
@@ -15,6 +15,7 @@ interface PortfolioComponentProps {
   symbol?: string;
   formatPrice?: (price: number) => string;
   formatQty?: (price: number, qty: number) => string;
+  zones?: LiquidityZone[];
 }
 
 export function PortfolioComponent({
@@ -30,7 +31,8 @@ export function PortfolioComponent({
   completedTradesCount,
   symbol = "BTCUSDT",
   formatPrice,
-  formatQty
+  formatQty,
+  zones
 }: PortfolioComponentProps) {
   const activeSymbolName = symbol.toUpperCase();
   const baseAsset = activeSymbolName.replace("USDT", "").replace("BUSD", "");
@@ -61,6 +63,74 @@ export function PortfolioComponent({
       slPrice = position.entryPrice + target.sl;
     }
   }
+
+  // Calculate dynamic Trade Health Index & Case Evaluation
+  let tradeHealthIndex = 100;
+  let caseEvaluationResult = "STABLE";
+  let caseEvaluationColor = "text-[#38bdf8]";
+  let caseEvaluationIconColor = "bg-[#38bdf8]/10 border-[#38bdf8]/20";
+  let healthBarColor = "bg-[#38bdf8]";
+  
+  if (position) {
+    const tpTarget = tpPrice ? Math.abs(tpPrice - position.entryPrice) : 120.0;
+    const slTarget = slPrice ? Math.abs(slPrice - position.entryPrice) : 40.0;
+    const currentPriceDiff = currentPrice - position.entryPrice;
+    const pathPnL = position.side === 'BUY' ? currentPriceDiff : -currentPriceDiff;
+    
+    let pnlComponent = 100;
+    if (pathPnL < 0) {
+      const slProximity = Math.min(1, Math.abs(pathPnL) / slTarget);
+      pnlComponent -= slProximity * 60; // Max -60 points close to SL
+    } else {
+      const tpProximity = Math.min(1, pathPnL / tpTarget);
+      pnlComponent += tpProximity * 20; // Max +20 points close to TP
+    }
+
+    const positionCvd = position.positionCvd || 0;
+    const isSupportingCvd = position.side === 'BUY' ? positionCvd > 0 : positionCvd < 0;
+    const cvdMagnitude = Math.abs(positionCvd);
+    let cvdComponent = 0;
+    if (isSupportingCvd) {
+      cvdComponent = Math.min(20, cvdMagnitude * 10);
+    } else {
+      cvdComponent = -Math.min(30, cvdMagnitude * 15);
+    }
+
+    const adverseEnergy = position.adverseEnergy || 0;
+    const maxAdverseEnergyThreshold = slTarget * 4.5;
+    const adverseEnergyRatio = Math.min(1, adverseEnergy / maxAdverseEnergyThreshold);
+    const adverseEnergyComponent = -adverseEnergyRatio * 40;
+
+    tradeHealthIndex = Math.round(Math.max(0, Math.min(100, pnlComponent + cvdComponent + adverseEnergyComponent)));
+
+    if (tradeHealthIndex >= 85) {
+      caseEvaluationResult = "Strong Trend / Bull Run";
+      caseEvaluationColor = "text-[#00ff41]";
+      caseEvaluationIconColor = "bg-[#00ff41]/10 border-[#00ff41]/20";
+      healthBarColor = "bg-[#00ff41]";
+    } else if (tradeHealthIndex >= 65) {
+      caseEvaluationResult = "Stable / Positive Flow";
+      caseEvaluationColor = "text-teal-400";
+      caseEvaluationIconColor = "bg-teal-500/10 border-teal-500/20";
+      healthBarColor = "bg-teal-400";
+    } else if (tradeHealthIndex >= 45) {
+      caseEvaluationResult = "Chippy Consolidation";
+      caseEvaluationColor = "text-amber-400";
+      caseEvaluationIconColor = "bg-amber-500/10 border-amber-500/20";
+      healthBarColor = "bg-amber-500";
+    } else if (tradeHealthIndex >= 25) {
+      caseEvaluationResult = "Under Strain / Exit Warning";
+      caseEvaluationColor = "text-orange-400";
+      caseEvaluationIconColor = "bg-orange-500/10 border-orange-500/20";
+      healthBarColor = "bg-orange-500";
+    } else {
+      caseEvaluationResult = "Extreme Risk / Stop Imminent";
+      caseEvaluationColor = "text-red-500 animate-pulse font-extrabold";
+      caseEvaluationIconColor = "bg-red-500/20 border-red-500/30";
+      healthBarColor = "bg-red-500";
+    }
+  }
+
   return (
     <div className="flex-1 flex flex-col gap-4 min-h-0 w-full z-10">
       
@@ -220,28 +290,136 @@ export function PortfolioComponent({
                   </div>
                </div>
 
-               {/* Real-time cumulative adverse pressure tracking */}
-               <div className="mt-2 mb-3 bg-[#0a0f1d]/50 p-2.5 rounded border border-[#1a2233]/70 font-mono text-[10px]">
+               {/* Dynamic Case Evaluation / Trade Health Index */}
+               <div className="mt-2 mb-3 bg-[#0a0f1d]/50 p-3 rounded border border-[#1a2233]/70 font-mono text-[10px]">
                   <div className="flex justify-between items-center text-[#64748b] mb-1.5 uppercase tracking-wider">
-                    <span>Накоп. CVD сделки (CVD delta)</span>
-                    <span className={`font-bold ${position.positionCvd !== undefined && position.positionCvd >= 0 ? 'text-[#00ff41]' : 'text-red-400'}`}>
-                      {position.positionCvd !== undefined && position.positionCvd >= 0 ? '+' : ''}{(position.positionCvd || 0).toFixed(2)}k {baseAsset}
+                    <span>Оценка ситуации (Case Evaluation)</span>
+                    <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold border ${caseEvaluationIconColor}`}>
+                      {caseEvaluationResult}
                     </span>
                   </div>
                   <div className="flex justify-between items-center text-[#64748b] uppercase tracking-wider">
-                    <span>Давление Против Позиции (Adverse Energy)</span>
-                    <span className={`font-bold ${position.adverseEnergy !== undefined && position.adverseEnergy > (slPrice ? Math.abs(position.entryPrice - slPrice) * 1.5 : 180) ? 'text-amber-400' : 'text-gray-400'}`}>
-                      {(position.adverseEnergy || 0).toFixed(1)} / {((slPrice ? Math.abs(position.entryPrice - slPrice) * 4.5 : 180)).toFixed(1)}
+                    <span>Индекс успешности сделки (Health Index)</span>
+                    <span className={`font-bold text-xs ${caseEvaluationColor}`}>
+                      {tradeHealthIndex}%
                     </span>
                   </div>
-                  <div className="w-full bg-[#111827] h-1.5 rounded-full overflow-hidden mt-1.5 border border-[#1a2233]">
-                    <div 
-                      className={`h-full transition-all duration-300 ${position.adverseEnergy !== undefined && position.adverseEnergy > (slPrice ? Math.abs(position.entryPrice - slPrice) * 2.25 : 90) ? 'bg-red-500' : 'bg-amber-500'}`}
-                      style={{ 
-                        width: `${Math.min(100, ((position.adverseEnergy || 0) / (slPrice ? Math.abs(position.entryPrice - slPrice) * 4.5 : 180)) * 100)}%` 
-                       }}
-                    />
+                  <div className="w-full bg-[#111827] h-2 rounded-full overflow-hidden mt-2 border border-[#1a2233]">
+                     <div 
+                       className={`h-full transition-all duration-500 ${healthBarColor}`}
+                       style={{ 
+                         width: `${tradeHealthIndex}%` 
+                        }}
+                     />
                   </div>
+                  
+                  {/* Detailed metrics breakdown */}
+                  <div className="grid grid-cols-2 gap-2 mt-2 pt-2 border-t border-[#1a2233]/40 text-[9px] text-[#52647c] uppercase">
+                     <div className="flex justify-between">
+                       <span>Накопленный CVD:</span>
+                       <span className={position.positionCvd >= 0 ? "text-emerald-400" : "text-red-400"}>
+                         {position.positionCvd >= 0 ? "+" : ""}{(position.positionCvd || 0).toFixed(2)}k
+                       </span>
+                     </div>
+                     <div className="flex justify-between">
+                       <span>Давление против позы:</span>
+                       <span className={`font-bold ${(position.unrealizedPnL || 0) < 0 ? "text-red-400" : "text-[#00ff41]"}`}>
+                         {(position.adverseEnergy || 0) >= 1000 
+                           ? `${((position.adverseEnergy || 0) / 1000).toFixed(2)}k e` 
+                           : `${(position.adverseEnergy || 0).toFixed(1)}e`}
+                       </span>
+                     </div>
+                  </div>
+
+                  {/* Zone Accumulator Overlay */}
+                  {position.zoneTouchActive ? (
+                    <div className="mt-2.5 pt-2 border-t border-dashed border-[#1a2233]/50 text-[9px]">
+                      <div className="flex justify-between items-center text-[#14b8a6] uppercase font-bold mb-1 tracking-wider">
+                        <span>Аккумуляция в зоне ({position.zoneTouchType})</span>
+                        <span className="animate-pulse flex items-center gap-1 text-[8px] bg-[#14b8a6]/10 px-1 py-0.5 rounded border border-[#14b8a6]/20">
+                          <span className="inline-block w-1 h-1 rounded-full bg-[#14b8a6]"></span>
+                          LIVE REC
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[#64748b] font-mono">
+                        <div className="flex justify-between">
+                          <span>Уровень POC:</span>
+                          <span className="text-gray-300 font-bold">${(position.zoneTouchPrice || 0).toFixed(1)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span>Кол-во замерных тиков:</span>
+                          <span className="text-gray-300">{position.zoneTicksCount || 0}t</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span>Накопл. зона CVD:</span>
+                          <span className={`font-bold ${(position.zoneAccumulatedCvd || 0) >= 0 ? "text-[#00ff41]" : "text-red-400"}`}>
+                            {(position.zoneAccumulatedCvd || 0) >= 0 ? "+" : ""}{(position.zoneAccumulatedCvd || 0).toFixed(2)}k
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span>Статус POC:</span>
+                          {position.zonePocHit ? (
+                             <span className="text-emerald-400 font-bold">🎯 Decision Active</span>
+                          ) : (
+                             <span className="text-amber-400 font-bold animate-pulse">⏳ Penetrating...</span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ) : (() => {
+                    const activeZones = (zones || []).filter(z => !z.isBroken && z.type !== "ACTIVE POS LIQ" && !z.type.startsWith("PRED LIQ"));
+                    let nearestZone: LiquidityZone | null = null;
+                    let minDistance = Infinity;
+
+                    activeZones.forEach(z => {
+                      const zLow = z.priceLow !== undefined ? z.priceLow : z.price;
+                      const zHigh = z.priceHigh !== undefined ? z.priceHigh : z.price;
+                      let dist = 0;
+                      if (currentPrice > zHigh) {
+                        dist = currentPrice - zHigh;
+                      } else if (currentPrice < zLow) {
+                        dist = zLow - currentPrice;
+                      } else {
+                        dist = 0;
+                      }
+                      if (dist < minDistance) {
+                        minDistance = dist;
+                        nearestZone = z;
+                      }
+                    });
+
+                    return (
+                      <div className="mt-2.5 pt-2 border-t border-dashed border-[#1a2233]/40 text-[9px]">
+                        <div className="flex justify-between items-center text-[#64748b] uppercase font-bold mb-1 tracking-wider">
+                          <span>Контроль уровней (Decider Standby)</span>
+                          <span className="flex items-center gap-1 text-[8px] text-[#38bdf8] bg-[#38bdf8]/10 px-1 py-0.5 rounded border border-[#38bdf8]/20">
+                            <span className="inline-block w-1.5 h-1.5 rounded-full bg-[#38bdf8] animate-pulse"></span>
+                            ACTIVE SCAN
+                          </span>
+                        </div>
+                        {nearestZone ? (
+                          <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[#52647c] font-mono mt-1">
+                            <div className="flex justify-between">
+                              <span>Ближайший уровень:</span>
+                              <span className="text-gray-400 font-semibold">{nearestZone.type}</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span>Цель уровня (POC):</span>
+                              <span className="text-gray-400 font-bold">${nearestZone.price.toFixed(1)}</span>
+                            </div>
+                            <div className="flex justify-between col-span-2 border-t border-[#1a2233]/25 pt-1 mt-0.5">
+                              <span>Удаленность до границы:</span>
+                              <span className="text-[#38bdf8] font-bold">
+                                {minDistance === 0 ? "Касание зоны" : `${minDistance.toFixed(1)} USDT`}
+                              </span>
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="text-gray-500 italic font-mono text-[8px] mt-1">Локальные экстремумы поддержки/сопротивления не обнаружены</p>
+                        )}
+                      </div>
+                    );
+                  })()}
                </div>
 
                <div className="bg-black/40 p-3 rounded border border-[#1a2233] mb-4 flex justify-between items-center mt-auto">
@@ -270,6 +448,63 @@ export function PortfolioComponent({
                <p className="text-[10px] text-gray-500 max-w-[280px] mt-1">
                  Бот FSM еще не вошел в сделку у зоны ликвидности, либо вы можете открыть позицию вручную кнопками слева.
                </p>
+
+               <div className="w-full mt-4 border-t border-[#1a2233]/40 pt-4 text-left max-w-[320px]">
+                  {(() => {
+                    const activeZones = (zones || []).filter(z => !z.isBroken && z.type !== "ACTIVE POS LIQ" && !z.type.startsWith("PRED LIQ"));
+                    let nearestZone: LiquidityZone | null = null;
+                    let minDistance = Infinity;
+
+                    activeZones.forEach(z => {
+                      const zLow = z.priceLow !== undefined ? z.priceLow : z.price;
+                      const zHigh = z.priceHigh !== undefined ? z.priceHigh : z.price;
+                      let dist = 0;
+                      if (currentPrice > zHigh) {
+                        dist = currentPrice - zHigh;
+                      } else if (currentPrice < zLow) {
+                        dist = zLow - currentPrice;
+                      } else {
+                        dist = 0;
+                      }
+                      if (dist < minDistance) {
+                        minDistance = dist;
+                        nearestZone = z;
+                      }
+                    });
+
+                    return (
+                      <div className="bg-[#0e1322]/40 p-3 rounded border border-[#1a2233] text-[9px] w-full">
+                        <div className="flex justify-between items-center text-[#64748b] uppercase font-bold mb-1.5 tracking-wider">
+                          <span>Контроль уровней (Decider Standby)</span>
+                          <span className="flex items-center gap-1 text-[8px] text-[#38bdf8] bg-[#38bdf8]/10 px-1 py-0.5 rounded border border-[#38bdf8]/20 animate-pulse">
+                            <span className="inline-block w-1.5 h-1.5 rounded-full bg-[#38bdf8]"></span>
+                            ACTIVE SCAN
+                          </span>
+                        </div>
+                        {nearestZone ? (
+                          <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[#52647c] font-mono mt-1">
+                            <div className="flex justify-between">
+                              <span>Ближайший уровень:</span>
+                              <span className="text-gray-400 font-semibold">{(nearestZone as LiquidityZone).type}</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span>Цель уровня (POC):</span>
+                              <span className="text-gray-400 font-bold">${(nearestZone as LiquidityZone).price.toFixed(1)}</span>
+                            </div>
+                            <div className="flex justify-between col-span-2 border-t border-[#1a2233]/25 pt-1.5 mt-1">
+                              <span>Удаленность до границы:</span>
+                              <span className="text-[#38bdf8] font-bold">
+                                {minDistance === 0 ? "Касание зоны" : `${minDistance.toFixed(1)} USDT`}
+                              </span>
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="text-gray-500 italic font-mono text-[8px] mt-1">Локальные экстремумы поддержки/сопротивления не обнаружены</p>
+                        )}
+                      </div>
+                    );
+                  })()}
+               </div>
             </div>
           )}
         </div>

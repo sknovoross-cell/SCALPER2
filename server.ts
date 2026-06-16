@@ -35,10 +35,10 @@ let disconnectBinanceFeed: (() => void) | null = null;
 function connectBinance(symbol = "btcusdt") {
   const symbolLower = symbol.toLowerCase().trim();
   const wsEndpoints = [
-    `wss://fstream.binanceapi.com/ws/${symbolLower}@aggTrade`,
-    `wss://fstream.binance.me/ws/${symbolLower}@aggTrade`,
-    `wss://fstream.binance.cc/ws/${symbolLower}@aggTrade`,
-    `wss://fstream.binance.com/ws/${symbolLower}@aggTrade`
+    `wss://fstream.binanceapi.com/stream?streams=${symbolLower}@aggTrade/${symbolLower}@openInterest`,
+    `wss://fstream.binance.me/stream?streams=${symbolLower}@aggTrade/${symbolLower}@openInterest`,
+    `wss://fstream.binance.cc/stream?streams=${symbolLower}@aggTrade/${symbolLower}@openInterest`,
+    `wss://fstream.binance.com/stream?streams=${symbolLower}@aggTrade/${symbolLower}@openInterest`
   ];
   let endpointIndex = 0;
   let active = true;

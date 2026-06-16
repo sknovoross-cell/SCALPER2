@@ -12,6 +12,8 @@ export interface ChartCandle {
 
 export interface LiquidityZone {
   price: number;
+  priceLow?: number;
+  priceHigh?: number;
   type: string;
   color: string;
   levelStrength?: 'HTF' | 'LTF';
@@ -44,6 +46,15 @@ export interface TradePosition {
   positionCvd?: number;
   adverseTicksCount?: number;
   adverseEnergy?: number;
+  zoneTouchActive?: boolean;
+  zoneTouchPrice?: number;
+  zoneTouchType?: string;
+  zoneAccumulatedCvd?: number;
+  zoneAccumulatedVolume?: number;
+  zoneTicksCount?: number;
+  zonePocHit?: boolean;
+  zoneKey?: string;
+  positionTicksCount?: number;
 }
 
 export interface HistorisedTrade {
@@ -91,9 +102,12 @@ export interface AppConfig {
     feeExitEnabled: boolean;
     predictiveLiqEnabled: boolean;
     preciseEntryEnabled: boolean;
+    shitcoinMode: boolean;
     leverage: number;
     tradeAmountUsd: number;
     reduceSizeOnLtf: boolean;
+    falseBreakoutDelayEnabled: boolean;
+    zoneTouchPocDeciderEnabled: boolean;
   };
 }
 

@@ -159,7 +159,29 @@ export function SettingsPanel({ config, onChange, onOpenSelector }: SettingsPane
                    />
                  </label>
                  <label className="flex items-center justify-between cursor-pointer select-none border-t border-[#1a2232]/50 pt-2 mt-1">
-                   <span className="text-[#14b8a6] font-semibold">Precise Entry Mode (Точный вход)</span>
+                   <span className="text-[#14b8a6] font-semibold"></span><span className="text-rose-500 font-bold hover:text-rose-400 transition-colors">Торговать говно (Low-Liq Mode)</span>
+                    <input 
+                      type="checkbox" 
+                      className="w-3.5 h-3.5 accent-rose-500 cursor-pointer" 
+                      checked={config.execution.shitcoinMode || false} 
+                      onChange={e => onChange({
+                        execution: { ...config.execution, shitcoinMode: e.target.checked }
+                      })} 
+                    />
+                  </label>
+                  <label className="flex items-center justify-between cursor-pointer select-none border-t border-[#1a2232]/50 pt-2 mt-1">
+                    <span className="text-[#38bdf8] font-semibold">Zone POC Decider (Решение на POC)</span>
+                    <input 
+                      type="checkbox" 
+                      className="w-3.5 h-3.5 accent-[#38bdf8] cursor-pointer" 
+                      checked={config.execution.zoneTouchPocDeciderEnabled !== false} 
+                      onChange={e => onChange({
+                        execution: { ...config.execution, zoneTouchPocDeciderEnabled: e.target.checked }
+                      })} 
+                    />
+                  </label>
+                  <label className="flex items-center justify-between cursor-pointer select-none border-t border-[#1a2232]/50 pt-2 mt-1">
+                    <span className="text-[#14b8a6] font-semibold">Precise Entry Mode (Точный вход)</span>
                    <input 
                      type="checkbox" 
                      className="w-3.5 h-3.5 accent-[#14b8a6] cursor-pointer" 
@@ -169,29 +191,22 @@ export function SettingsPanel({ config, onChange, onOpenSelector }: SettingsPane
                      })} 
                    />
                  </label>
+                 <label className="flex items-center justify-between cursor-pointer select-none border-t border-[#1a2232]/50 pt-2 mt-1">
+                   <span className="text-amber-500 font-semibold">ЛП: Вход на возврате (Retrace Filter)</span>
+                   <input 
+                     type="checkbox" 
+                     className="w-3.5 h-3.5 accent-amber-500 cursor-pointer" 
+                     checked={config.execution.falseBreakoutDelayEnabled || false} 
+                     onChange={e => onChange({
+                       execution: { ...config.execution, falseBreakoutDelayEnabled: e.target.checked }
+                     })} 
+                   />
+                 </label>
               </div>
             </div>
          </div>
        </div>
 
-      <div className="bg-[#0a0f1d]/80 border border-[#1a2233] rounded-lg p-3">
-        <h3 className="text-[#38bdf8] font-bold mb-3 tracking-wider uppercase opacity-90">Filters [Rust Engine]</h3>
-        <div className="space-y-3 relative">
-           <label className="flex flex-col gap-1">
-             <span className="text-[#64748b]">OI Growth Min (x)</span>
-             <input type="number" step="0.1" className="bg-[#050608] border border-[#1a2233] rounded px-2 py-1 text-[#e0e0e0]" value={config.filters.oiGrowthMin} onChange={e => onChange({filters: {...config.filters, oiGrowthMin: parseFloat(e.target.value)}})} />
-           </label>
-           <label className="flex flex-col gap-1">
-             <span className="text-[#64748b]">Tape Speed Mult (x)</span>
-             <input type="number" step="0.1" className="bg-[#050608] border border-[#1a2233] rounded px-2 py-1 text-[#e0e0e0]" value={config.filters.tapeSpeedMultiplier} onChange={e => onChange({filters: {...config.filters, tapeSpeedMultiplier: parseFloat(e.target.value)}})} />
-           </label>
-           <label className="flex flex-col gap-1">
-             <span className="text-[#64748b]">Spoof Lifetime (ms)</span>
-             <input type="number" step="10" className="bg-[#050608] border border-[#1a2233] rounded px-2 py-1 text-[#e0e0e0]" value={config.filters.spoofingLifetimeMs} onChange={e => onChange({filters: {...config.filters, spoofingLifetimeMs: parseInt(e.target.value)}})} />
-           </label>
-        </div>
-      </div>
-      
-    </div>
-  );
-}
+     </div>
+   );
+ }

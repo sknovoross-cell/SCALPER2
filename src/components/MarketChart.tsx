@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, ReferenceDot, CartesianGrid } from 'recharts';
+import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, ReferenceDot, CartesianGrid, ReferenceArea } from 'recharts';
 import { ChartCandle, LiquidityZone, HistorisedTrade } from '../types';
 import { 
   Maximize2, 
@@ -749,7 +749,26 @@ export function MarketChart({
               isAnimationActive={false} 
             />
 
-             {/* Pivot support/resistance and daily swing levels visual reference lines */}
+             {/* Pivot support/resistance and daily swing levels visual reference zones (filled bands) */}
+            {resolvedZones.map((z, i) => {
+              if (z.priceLow === undefined || z.priceHigh === undefined) return null;
+              const isLtf = z.levelStrength === 'LTF';
+              const isBroken = z.isBroken;
+              return (
+                <ReferenceArea 
+                  {...({
+                    key: `area-${i}`,
+                    y1: z.priceLow,
+                    y2: z.priceHigh,
+                    fill: isBroken ? "#1f2937" : z.color,
+                    fillOpacity: isBroken ? 0.03 : (isLtf ? 0.05 : 0.12),
+                    stroke: "none"
+                  } as any)}
+                />
+              );
+            })}
+
+             {/* Pivot support/resistance center POC line */}
             {resolvedZones.map((z, i) => {
               const isLtf = z.levelStrength === 'LTF';
               const isBroken = z.isBroken;
@@ -758,9 +777,9 @@ export function MarketChart({
                   key={`line-${i}`} 
                   y={z.price} 
                   stroke={isBroken ? "#475569" : z.color} 
-                  strokeOpacity={isBroken ? 0.2 : (isLtf ? 0.35 : 0.75)} 
-                  strokeWidth={isLtf ? 1 : 1.5} 
-                  strokeDasharray={isBroken ? "1 5" : (isLtf ? "2 3" : "5 2")}
+                  strokeOpacity={isBroken ? 0.15 : (isLtf ? 0.3 : 0.65)} 
+                  strokeWidth={isLtf ? 0.75 : 1.25} 
+                  strokeDasharray={isBroken ? "1 5" : (isLtf ? "2 2" : "4 2")}
                 />
               );
             })}
@@ -768,7 +787,7 @@ export function MarketChart({
             {resolvedZones.map((z, i) => {
               const isLtf = z.levelStrength === 'LTF';
               const isBroken = z.isBroken;
-              const marker = isBroken ? 'BROKEN / PASSIVE' : (isLtf ? 'LTF - Risk -50%' : 'HTF - Strong');
+              const marker = isBroken ? 'BROKEN' : (isLtf ? 'LTF ZONE' : 'HTF ZONE');
               return (
                 <ReferenceLine 
                   key={`lbl-${i}`} 
@@ -776,7 +795,7 @@ export function MarketChart({
                   stroke="none" 
                   label={{ 
                     position: z.position, 
-                    value: `[${z.type}] ${formatPrice(z.price)} (${marker})`, 
+                    value: `[${z.type}] POC: ${formatPrice(z.price)} (${marker})`, 
                     fill: isBroken ? "#475569" : z.color, 
                     fontSize: isLtf ? 9 : 10, 
                     fontFamily: 'monospace', 

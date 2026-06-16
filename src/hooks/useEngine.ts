@@ -40,13 +40,16 @@ const INITIAL_CONFIG: AppConfig = {
     breakevenEnabled: true,
     trailingStopEnabled: true,
     partialTakeProfitEnabled: true,
-    signalExitEnabled: true,
+    signalExitEnabled: false,
     feeExitEnabled: false,
     predictiveLiqEnabled: true,
     preciseEntryEnabled: false,
+    shitcoinMode: false,
     leverage: 20,
     tradeAmountUsd: 1000.0,
     reduceSizeOnLtf: true,
+    falseBreakoutDelayEnabled: false,
+    zoneTouchPocDeciderEnabled: true,
   },
 };
 
@@ -247,8 +250,16 @@ export function useEngine() {
   // Performance analytics refs for Cumulative session volume delta (CVD) & Order Flow Speed Baseline
   const cvdCumulativeRef = useRef<number>(0);
   const tapeSpeedHistoryRef = useRef<number[]>([]);
+  const tickVolumeHistoryRef = useRef<number[]>([]);
+  const dynamicZScoreThresholdRef = useRef<number>(1.8);
   const oiRef = useRef<number>(1342.5); // Live-mode Open Interest modeling value ($ million)
   const prevOiRef = useRef<number>(1342.5);
+  const lastOiMsgTimeRef = useRef<number>(0);
+  const [warmupSecondsLeft, setWarmupSecondsLeft] = useState<number>(60);
+  const warmupSecondsLeftRef = useRef<number>(60);
+  warmupSecondsLeftRef.current = warmupSecondsLeft;
+  const prevPriceRef = useRef<number>(0);
+  const levelPokeTrackerRef = useRef<Record<string, { pierced: boolean; maxPriceSeen?: number; minPriceSeen?: number; timestamp: number }>>({});
   const cooldownTicksRef = useRef<number>(0);
   const atrRef = useRef<number>(60); // 5m ATR for adaptive volatility-based interaction zones
   const lastIgnoreLogTimeRef = useRef<Record<string, number>>({});
@@ -303,6 +314,10 @@ export function useEngine() {
   // Core level collector & chart data loader
   const loadData = async (isPeriodic = false) => {
     if (isRecalculatingRef.current) return;
+    if (isPeriodic && (stateRef.current === "ARMED" || stateRef.current === "APPROACHING" || stateRef.current === "EXECUTING")) {
+      console.log("Deferring periodic levels re-evaluation: active FSM state is ARMED/APPROACHING/EXECUTING.");
+      return;
+    }
     const baseAsset = (configRef.current.symbols || "BTCUSDT").trim().toUpperCase().replace("USDT", "").replace("BUSD", "");
     isRecalculatingRef.current = true;
     try {
@@ -833,200 +848,167 @@ export function useEngine() {
       extractPivots(parsed5m, "M5", "#fb7185", "#38bdf8", 1, "5m"); // rose / sky
       extractPivots(parsed1m, "M1", "#ec4899", "#14b8a6", 0.5, "1m"); // pink / teal
 
-      // Sort candidated pivot zones by timeframe scale weight (seniority)
-      candidates.sort((a, b) => b.scale - a.scale);
+      // Sort candidate pivot zones by price first for 1D DBSCAN clustering
+      const scaleRel = finalPrice / 60000.0;
+      const baseEps = Math.max(50 * scaleRel, atrRef.current * 0.45);
 
-      // Filter and deduplicate levels (minimum distance filter to avoid overlapping lines in visualization)
+      const sortedPivots = [...candidates].sort((a, b) => a.price - b.price);
+      const clusters: typeof candidates[] = [];
+
+      if (sortedPivots.length > 0) {
+        let currentCluster = [sortedPivots[0]];
+        for (let i = 1; i < sortedPivots.length; i++) {
+          const prev = sortedPivots[i - 1];
+          const curr = sortedPivots[i];
+          // If consecutive pivots are within baseEps of each other, group them
+          if (curr.price - prev.price <= baseEps) {
+            currentCluster.push(curr);
+          } else {
+            clusters.push(currentCluster);
+            currentCluster = [curr];
+          }
+        }
+        clusters.push(currentCluster);
+      }
+
+      const processedClusters: typeof candidates[] = [];
+
+      // Recursive cluster splitting logic to break up excessively wide zones (>0.45%)
+      // This identifies focal density hubs ("очаги") by splitting at the largest gaps
+      function splitClusterIfTooWide(cluster: typeof candidates): (typeof candidates)[] {
+        if (cluster.length <= 1) return [cluster];
+        
+        const priceLow = Math.min(...cluster.map(p => p.price));
+        const priceHigh = Math.max(...cluster.map(p => p.price));
+        const maxWidth = finalPrice * 0.0045; // 0.45% of current price as threshold
+        
+        if (priceHigh - priceLow <= maxWidth) {
+          return [cluster];
+        }
+        
+        const sortedCopy = [...cluster].sort((a, b) => a.price - b.price);
+        let maxGap = -1;
+        let splitIndex = -1;
+        
+        for (let i = 0; i < sortedCopy.length - 1; i++) {
+          const gap = sortedCopy[i + 1].price - sortedCopy[i].price;
+          if (gap > maxGap) {
+            maxGap = gap;
+            splitIndex = i;
+          }
+        }
+        
+        if (splitIndex !== -1) {
+          const leftPart = sortedCopy.slice(0, splitIndex + 1);
+          const rightPart = sortedCopy.slice(splitIndex + 1);
+          
+          return [
+            ...splitClusterIfTooWide(leftPart),
+            ...splitClusterIfTooWide(rightPart)
+          ];
+        }
+        
+        return [cluster];
+      }
+
+      clusters.forEach((cl) => {
+        processedClusters.push(...splitClusterIfTooWide(cl));
+      });
+
       const distinctZones: LiquidityZone[] = [];
-      candidates.forEach((cand) => {
-        const scaleRel = cand.price / 60000.0;
-        // Dynamic cluster threshold based on price magnitude & TF seniority.
-        // Senior levels have a wider filter (~290 USD), while junior levels support tighter cascades (~50 USD)
-        let clusterThreshold =
-          cand.levelStrength === "HTF"
-            ? Math.max(120 * scaleRel, cand.price * 0.0045)
-            : Math.max(45 * scaleRel, cand.price * 0.0008);
 
-        // Let M1 timeframe levels sit closer to other levels for maximum detail, but not cluster too tightly to prevent noise
-        if (cand.timeframe === "1m") {
-          clusterThreshold = Math.max(45 * scaleRel, cand.price * 0.0007);
-        }
+      processedClusters.forEach((cluster) => {
+        // Find the strongest candidate inside the cluster to serve as the anchor / core POC
+        const sortedInCluster = [...cluster].sort((a, b) => {
+          if (b.scale !== a.scale) return b.scale - a.scale;
+          if ((b.touchesCount || 0) !== (a.touchesCount || 0)) return (b.touchesCount || 0) - (a.touchesCount || 0);
+          return (b.volumeScore || 0) - (a.volumeScore || 0);
+        });
 
-        // --- NEW RULE: JUNIOR PROXIMITY SUPPRESSION TO SENIOR LEVELS ---
-        // If this candidate is a junior level (1m or 5m), check if there is any senior level (15m, 1h, 4h, 1d) that is very close.
-        if (cand.timeframe === "1m" || cand.timeframe === "5m") {
-          const hasNearbySenior = distinctZones.some((z) => {
-            const isSenior = z.timeframe !== "1m" && z.timeframe !== "5m";
-            if (!isSenior) return false;
-            // Proximity limit: e.g., 0.25% of price (~$160 for BTC).
-            // If the junior level is close, we suppress it because the senior level is much more valid!
-            const proximityLimit = Math.max(160 * scaleRel, cand.price * 0.0025);
-            return Math.abs(z.price - cand.price) < proximityLimit;
-          });
-          if (hasNearbySenior) {
-            // Suppress the level!
-            return;
-          }
-        }
-        // ---------------------------------------------------------------
+        const anchor = sortedInCluster[0];
 
-        const matchingZone = distinctZones.find(
-          (z) => Math.abs(z.price - cand.price) < clusterThreshold,
-        );
-        if (matchingZone) {
-          // Merge validating signs of strength!
-          matchingZone.volumeScore =
-            (matchingZone.volumeScore || 0) + (cand.volumeScore || 0);
-          matchingZone.cvdScore =
-            (matchingZone.cvdScore || 0) + (cand.cvdScore || 0);
-          matchingZone.oiScore =
-            (matchingZone.oiScore || 0) + (cand.oiScore || 0);
-          matchingZone.touchesCount =
-            (matchingZone.touchesCount || 1) + (cand.touchesCount || 1);
+        // Determine if zone is Support (Demand) or Resistance (Supply) based on majority vote of pivot types
+        const supportCount = cluster.filter(p => p.type.includes('SUPPORT') || p.type.includes('LOW')).length;
+        const resistCount = cluster.filter(p => p.type.includes('RESIST') || p.type.includes('HIGH')).length;
+        const isSupport = supportCount >= resistCount;
 
-          if (cand.levelStrength === "HTF") {
-            matchingZone.levelStrength = "HTF";
-          }
+        // Calculate aggregate scores across the cluster
+        const aggVolume = cluster.reduce((sum, p) => sum + (p.volumeScore || 0), 0);
+        const aggCvd = cluster.reduce((sum, p) => sum + (p.cvdScore || 0), 0);
+        const aggOi = cluster.reduce((sum, p) => sum + (p.oiScore || 0), 0);
+        const aggTouches = cluster.reduce((sum, p) => sum + (p.touchesCount || 1), 0);
 
-          if (!matchingZone.validationCriteria) {
-            matchingZone.validationCriteria = [];
-          }
-          const formattedVol = cand.volumeScore
-            ? cand.volumeScore.toLocaleString("ru-RU", {
-                maximumFractionDigits: 1,
-              })
-            : "0";
-          const formattedCvd = cand.cvdScore
-            ? cand.cvdScore.toLocaleString("ru-RU", {
-                maximumFractionDigits: 1,
-              })
-            : "0";
+        // Max scale weight determines level strength (HTF vs LTF)
+        const maxScale = Math.max(...cluster.map(p => p.scale));
+        const levelStrength: "HTF" | "LTF" = maxScale >= 3 ? "HTF" : "LTF";
 
-          matchingZone.validationCriteria.push(
-            `Сноска слияния: близкий уровень ${cand.timeframe?.toUpperCase()} (цена ${cand.price.toFixed(1)}) скооперирован. ` +
-              `Результирующий приток сил: объем +${formattedVol} ${baseAsset}, CVD +${formattedCvd} ${baseAsset}. ` +
-              `Итого касаний/слияний уровня: ${matchingZone.touchesCount}.`,
-          );
-          return;
+        const uniqueTfs = Array.from(new Set(cluster.map(p => p.timeframe).filter(Boolean)));
+        const primaryTf = anchor.timeframe || '1m';
+
+        // Calculate upper/lower boundaries of the zone
+        let priceLow = Math.min(...cluster.map(p => p.price));
+        let priceHigh = Math.max(...cluster.map(p => p.price));
+
+        // If the cluster is extremely narrow (e.g. single pivot), pad it by adaptive ATR padding to create a real zone
+        const minHeight = baseEps * 0.45;
+        if (priceHigh - priceLow < minHeight) {
+          const midpoint = (priceLow + priceHigh) / 2;
+          priceLow = midpoint - minHeight / 2;
+          priceHigh = midpoint + minHeight / 2;
         }
 
         const updateTimeStr = new Date().toLocaleTimeString("ru-RU");
-        const isResistance = cand.price >= finalPrice;
-        const tfUpper = (cand.timeframe || "1m").toUpperCase();
-        let finalType = cand.type;
-        let finalColor = cand.color;
+        const formattedVol = aggVolume.toLocaleString("ru-RU", { maximumFractionDigits: 0 });
+        const formattedCvd = aggCvd.toLocaleString("ru-RU", { maximumFractionDigits: 0 });
+        const formattedOi = aggOi.toLocaleString("ru-RU", { maximumFractionDigits: 0 });
+
         const criteria: string[] = [];
+        criteria.push(`[Кластеризация DBSCAN]: Сгруппировано ${cluster.length} локальных экстремумов в единый узел.`);
+        criteria.push(`Таймфреймы слияния: ${uniqueTfs.map(t => t.toUpperCase()).join(", ")}.`);
+        criteria.push(`Общий горизонтальный объем в зоне: ${formattedVol} ${baseAsset}.`);
+        criteria.push(`Результирующая разница CVD: ${aggCvd >= 0 ? '+' : ''}${formattedCvd} ${baseAsset}.`);
+        if (Math.abs(aggOi) > 10) {
+          criteria.push(`Изменение открытого интереса (OI) зоны: ${aggOi >= 0 ? '+' : ''}${formattedOi} ${baseAsset}.`);
+        }
+        criteria.push(`Суммарно тестов/касаний зоны: ${aggTouches}.`);
 
-        const formattedVol = cand.volumeScore
-          ? cand.volumeScore.toLocaleString("ru-RU", {
-              maximumFractionDigits: 1,
-            })
-          : "0";
-        const formattedCvd = cand.cvdScore
-          ? cand.cvdScore.toLocaleString("ru-RU", { maximumFractionDigits: 1 })
-          : "0";
-        const formattedOi = cand.oiScore
-          ? cand.oiScore.toLocaleString("ru-RU", { maximumFractionDigits: 1 })
-          : "0";
-
-        if (cand.promotedStr) {
-          criteria.push(cand.promotedStr);
+        // Add context based on timeframe presence
+        if (cluster.some(p => p.timeframe === '1d')) {
+          criteria.push("🔥 Сильнейшая дневной свинг-диапазон (аккумуляция ликвидности за 30 дней).");
+        } else if (cluster.some(p => p.timeframe === '4h' || p.timeframe === '1h')) {
+          criteria.push("⚡ Старший институциональный диапазон ордеров (Order Block H1-H4).");
         }
 
-        if (cand.touchesCount && cand.touchesCount > 1) {
-          criteria.push(
-            `Мульти-касание: уровень протестирован повторно (всего касаний: ${cand.touchesCount}). Объемы подтверждены.`,
-          );
-        }
-
-        if (cand.timeframe === "1d") {
-          finalType = isResistance ? "1D SWING RESIST" : "1D SWING SUPPORT";
-          finalColor = isResistance ? "#f43f5e" : "#3b82f6";
-          criteria.push(
-            "Крайние точки диапазона (Swing): Абсолютный экстремум за 30 дней.",
-          );
-          criteria.push(`Горизонтальный объем уровня: ${formattedVol} ${baseAsset}.`);
-          criteria.push(
-            isResistance
-              ? `Поглощение на хаях: Лимитные ордера продавцов остановили покупателей (Delta: ${formattedCvd} ${baseAsset}).`
-              : `Поглощение на лоях: Лимитный спрос поглотил агрессивные продажи (Delta: ${formattedCvd} ${baseAsset}).`,
-          );
-          if (cand.oiScore && cand.oiScore > 0) {
-            criteria.push(
-              `Приток позиций на уровне (OI): +${formattedOi} ${baseAsset}.`,
-            );
-          }
-        } else {
-          finalType = isResistance ? `${tfUpper} RESIST` : `${tfUpper} SUPPORT`;
-          if (cand.timeframe === "4h") {
-            finalColor = isResistance ? "#f59e0b" : "#10b981";
-          } else if (cand.timeframe === "1h") {
-            finalColor = isResistance ? "#d946ef" : "#06b6d4";
-          } else if (cand.timeframe === "15m") {
-            finalColor = isResistance ? "#84cc16" : "#a855f7";
-          } else if (cand.timeframe === "5m") {
-            finalColor = isResistance ? "#fb7185" : "#38bdf8";
-          } else {
-            // 1m
-            finalColor = isResistance ? "#ec4899" : "#14b8a6";
-          }
-
-          if (cand.levelStrength === "HTF") {
-            criteria.push(
-              `Старший разворот ${tfUpper}: Подтвержденная 3-барная структура.`,
-            );
-            criteria.push(`Аккумуляция объема в узле: ${formattedVol} ${baseAsset}.`);
-            if (isResistance) {
-              criteria.push(
-                `Ограничение спроса (CVD): Рост покупок выдохся перед лимитами продавцов (Delta: ${formattedCvd} ${baseAsset}).`,
-              );
-            } else {
-              criteria.push(
-                `Удержание продаж (CVD): Рыночное давление увяхло в плотной поддержке (Delta: ${formattedCvd} ${baseAsset}).`,
-              );
-            }
-            if (cand.oiScore && cand.oiScore > 0) {
-              criteria.push(
-                `Набор встречных позиций (OI): +${formattedOi} ${baseAsset} в стакане.`,
-              );
-            }
-          } else {
-            criteria.push(
-              `Разворотный микро-свинг ${tfUpper}: Локальная кульминация.`,
-            );
-            criteria.push(`Скальп-объем: Проторговано ${formattedVol} ${baseAsset}.`);
-            criteria.push(
-              isResistance
-                ? `Всплеск ложных покупок (Delta: ${formattedCvd} ${baseAsset}) прерван лимитным барьером.`
-                : `Капитуляция ритейл-продавцов (Delta: ${formattedCvd} ${baseAsset}) выкуплена по рынку.`,
-            );
-            if (cand.oiScore && Math.abs(cand.oiScore) > 10) {
-              criteria.push(
-                `Изменение OI: ${cand.oiScore > 0 ? "+" : ""}${formattedOi} ${baseAsset}.`,
-              );
-            }
-          }
-        }
+        // Color and name formatting
+        const isHTF = levelStrength === 'HTF';
+        const zoneType = isSupport 
+          ? (isHTF ? `${primaryTf.toUpperCase()} DEMAND ZONE (OB)` : `${primaryTf.toUpperCase()} SUPPORT`)
+          : (isHTF ? `${primaryTf.toUpperCase()} SUPPLY ZONE (OB)` : `${primaryTf.toUpperCase()} RESIST`);
+          
+        const zoneColor = isSupport 
+          ? (isHTF ? "#10b981" : "#06b6d4") // Emerald / Cyan
+          : (isHTF ? "#f43f5e" : "#d946ef"); // Rose / Fuchsia
 
         distinctZones.push({
-          price: cand.price,
-          type: finalType,
-          color: finalColor,
-          levelStrength: cand.levelStrength,
-          timeframe: cand.timeframe,
+          price: anchor.price, // POC is anchored to the peak-volume price point in cluster
+          priceLow,
+          priceHigh,
+          type: zoneType,
+          color: zoneColor,
+          levelStrength,
+          timeframe: primaryTf,
           updatedAt: updateTimeStr,
           validationCriteria: criteria,
-          volumeScore: cand.volumeScore,
-          cvdScore: cand.cvdScore,
-          oiScore: cand.oiScore,
-          touchesCount: cand.touchesCount || 1,
+          volumeScore: aggVolume,
+          cvdScore: aggCvd,
+          oiScore: aggOi,
+          touchesCount: aggTouches,
           isBroken: false,
           lastTouchTimestamp: Date.now(),
         });
       });
 
-      // Allow up to 120 zones globally so junior timeframes (1m, 5m) don't get chopped off,
-      // while the components dynamically filter relevant levels depending on the active timeframe
+      // Allow up to 120 zones globally so junior timeframes (1m, 5m) don't get chopped off
       setZones(distinctZones.slice(0, 120));
     } catch (e) {
       console.error("Error recalculating zones:", e);
@@ -1045,7 +1027,10 @@ export function useEngine() {
       setChartData([]);
       setZones([]);
       setMetrics([]);
+      setWarmupSecondsLeft(60);
       klinesCacheRef.current = {};
+      tapeSpeedHistoryRef.current = [];
+      tickVolumeHistoryRef.current = [];
       
       console.log(`Loading fresh indicators and levels for ${symbol}...`);
       loadData();
@@ -1061,6 +1046,24 @@ export function useEngine() {
     }, 60000);
     return () => clearInterval(interval);
   }, [config.symbols]);
+
+  // 1c. Warm-up timer countdown (1 minute / 60 seconds)
+  useEffect(() => {
+    if (halted) return;
+    if (warmupSecondsLeft <= 0) return;
+
+    const interval = setInterval(() => {
+      setWarmupSecondsLeft((prev) => {
+        if (prev <= 1) {
+          clearInterval(interval);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [halted, warmupSecondsLeft]);
 
   // Automatically swap active chart candles and reset timer when timeframe state changes
   useEffect(() => {
@@ -1107,7 +1110,8 @@ export function useEngine() {
           lastMsgTimeRef.current = Date.now();
 
           try {
-            const msg = JSON.parse(e.data);
+            const rawMsg = JSON.parse(e.data);
+            const msg = rawMsg.data ? rawMsg.data : rawMsg;
 
             if (msg.type === "ws_status") {
               if (msg.status && msg.status.startsWith("OK")) {
@@ -1137,6 +1141,12 @@ export function useEngine() {
               latencyBuffer.current.push(realLatency);
               if (latencyBuffer.current.length > 20)
                 latencyBuffer.current.shift();
+            } else if (msg.e === "openInterestUpdate") {
+              const latestRealOI = parseFloat(msg.o);
+              if (!isNaN(latestRealOI) && latestRealOI > 0) {
+                oiRef.current = latestRealOI;
+                lastOiMsgTimeRef.current = Date.now();
+              }
             }
           } catch (err) {
             // Squelch JSON parse errors
@@ -1195,7 +1205,16 @@ export function useEngine() {
 
       currentZones.forEach((z, idx) => {
         const checkPrice = newPrice === 0 ? z.price : newPrice;
-        const dist = Math.abs(z.price - checkPrice);
+        let dist = 0;
+        const pLow = z.priceLow !== undefined ? z.priceLow : z.price;
+        const pHigh = z.priceHigh !== undefined ? z.priceHigh : z.price;
+        if (checkPrice > pHigh) {
+          dist = checkPrice - pHigh;
+        } else if (checkPrice < pLow) {
+          dist = pLow - checkPrice;
+        } else {
+          dist = 0;
+        }
         if (dist < minD) {
           minD = dist;
           nearestZoneIndex = idx;
@@ -1211,12 +1230,49 @@ export function useEngine() {
         a.lastPrice = newPrice;
       }
 
+      // Update level poke tracker
+      currentZones.forEach((z) => {
+        if (z.isBroken) return;
+        const key = `${z.type}_${z.price}`;
+        const pHigh = z.priceHigh !== undefined ? z.priceHigh : z.price;
+        const pLow = z.priceLow !== undefined ? z.priceLow : z.price;
+
+        if (!levelPokeTrackerRef.current[key]) {
+          levelPokeTrackerRef.current[key] = {
+            pierced: false,
+            timestamp: 0,
+          };
+        }
+
+        const tracker = levelPokeTrackerRef.current[key];
+        const isResistance = z.type.includes("RES") || z.type.includes("HIGH") || z.type.includes("SUPPLY");
+        const isSupport = z.type.includes("SUP") || z.type.includes("LOW") || z.type.includes("DEMAND");
+
+        if (isResistance && newPrice >= pHigh) {
+          tracker.pierced = true;
+          tracker.maxPriceSeen = Math.max(tracker.maxPriceSeen || newPrice, newPrice);
+          tracker.timestamp = Date.now();
+        } else if (isSupport && newPrice <= pLow) {
+          tracker.pierced = true;
+          tracker.minPriceSeen = Math.min(tracker.minPriceSeen || newPrice, newPrice);
+          tracker.timestamp = Date.now();
+        }
+
+        // Expire tracker if it's older than 60 seconds
+        if (tracker.pierced && Date.now() - tracker.timestamp > 60000) {
+          tracker.pierced = false;
+          tracker.maxPriceSeen = undefined;
+          tracker.minPriceSeen = undefined;
+        }
+      });
+
       // Adaptive FSM interaction thresholds derived dynamically from 5m ATR
       const atrVal = atrRef.current || 60;
       const localScale = newPrice / 60000.0;
       const approachingThreshold = Math.max(12 * localScale, atrVal * 0.25); // Volatility-adapted approaching distance
       const armedThreshold = Math.max(5 * localScale, atrVal * 0.1); // Volatility-adapted trigger-ready distance
-      const armedExitThreshold = Math.max(8 * localScale, atrVal * 0.18); // Volatility-adapted interaction bounds exit
+      // Give ARMED state a wider exit corridor to allow price breathing and continuous flow analysis within/near high density zones, preventing premature resets
+      const armedExitThreshold = Math.max(22 * localScale, atrVal * 0.45); // Volatility-adapted interaction bounds exit
 
       // Aggregation of 100% Live real-time trade signals from Binance (zero emulation)
       const tradesCount = a.trades;
@@ -1238,7 +1294,18 @@ export function useEngine() {
         tapeSpeedHistoryRef.current.length > 0
           ? speedSum / tapeSpeedHistoryRef.current.length
           : 5.0;
-      const tapeSpeedBaseline = Math.max(1.8, baselineAvg); // floor baseline to ignore dead market skewing
+      
+      const isShitcoin = configRef.current.execution.shitcoinMode;
+      const speedFloor = isShitcoin ? 0.6 : 1.8;
+      const tapeSpeedBaseline = Math.max(speedFloor, baselineAvg); // floor baseline to ignore dead market skewing
+
+      // Calculate rolling standard deviation of tape speed
+      const tapeSpeedAvg = baselineAvg;
+      const speedVariance = tapeSpeedHistoryRef.current.reduce(
+        (sum, v) => sum + Math.pow(v - tapeSpeedAvg, 2),
+        0
+      ) / Math.max(1, tapeSpeedHistoryRef.current.length);
+      const tapeSpeedStdDev = tapeSpeedHistoryRef.current.length > 5 ? Math.sqrt(speedVariance) : 1.5;
 
       // Calculate relative tape speed acceleration
       const tapeAcceleration = tapeSpeed / tapeSpeedBaseline;
@@ -1252,28 +1319,159 @@ export function useEngine() {
       const orderbookImbalance =
         totalVolTick > 0 ? (buyVol - sellVol) / totalVolTick : 0.0;
 
-      // Real-time tracking of BTC Futures Open Interest (OI) with ZERO simulations (no random walks)
-      // Under accelerated volume conditions, intense market interaction increases active interest; under normal regimes, interest fluctuates proportionally with transaction flow imbalance.
-      let calculatedOiDelta = 0;
-      if (totalVolTick > 0) {
-        if (tapeAcceleration > 2.0) {
-          // High activity leads to deterministic contract accumulation/reduction based on order flow side
-          calculatedOiDelta = totalVolTick * 0.000004 * (cvdDelta > 0 ? 1 : -1);
-        } else {
-          // Standard flow: minor fluctuations reflecting order book imbalance
-          calculatedOiDelta = totalVolTick * 0.0000008 * orderbookImbalance;
+      // Track relative volume (RVOL) and tick-by-tick volumes for dynamic breakout/absorption adaptation
+      const volInThousand = totalVolTick / 1000;
+      tickVolumeHistoryRef.current.push(volInThousand);
+      if (tickVolumeHistoryRef.current.length > 120) {
+        tickVolumeHistoryRef.current.shift();
+      }
+      const volSum = tickVolumeHistoryRef.current.reduce((sum, v) => sum + v, 0);
+      const avgTickVol = tickVolumeHistoryRef.current.length > 0
+        ? volSum / tickVolumeHistoryRef.current.length
+        : 1.0;
+      const volVariance = tickVolumeHistoryRef.current.reduce(
+        (sum, v) => sum + Math.pow(v - avgTickVol, 2),
+        0
+      ) / Math.max(1, tickVolumeHistoryRef.current.length);
+      const tickVolStdDev = tickVolumeHistoryRef.current.length > 5 ? Math.sqrt(volVariance) : 0.3;
+
+      // --- DYNAMIC Z-SCORE IMPLEMENTATION ---
+      // 1. Z-Score representing how many standard deviations the current tape speed is from rolling baseline
+      const tapeSpeedZScore = tapeSpeedStdDev > 0 ? (tapeSpeed - tapeSpeedBaseline) / tapeSpeedStdDev : 0.0;
+
+      // 2. Coefficient of Variation (CV) measures relative dispersion: higher CV means a more erratic/bursty tape
+      const tapeSpeedCV = tapeSpeedAvg > 0 ? tapeSpeedStdDev / tapeSpeedAvg : 0.35;
+
+      // 3. Relative Volume (RVOL): whether current velocity has heavy transactional backing or is just high-frequency dust
+      const rvol = avgTickVol > 0 ? volInThousand / avgTickVol : 1.0;
+
+      // 4. Base Z-Score target threshold
+      const baseZScoreThreshold = isShitcoin ? 1.0 : 1.8;
+
+      // 5. Apply adaptive components:
+      // - Higher CV (erratic background noise) boosts required Z-Score threshold.
+      const cvAdjustment = (tapeSpeedCV - 0.4) * 0.4;
+
+      // - Strong volume confirmation discounts the threshold (allows earlier signal). Low-vol prints penalize.
+      let rvolAdjustment = 0;
+      if (rvol > 1.5) {
+        rvolAdjustment = -Math.min(0.4, (rvol - 1.0) * 0.15);
+      } else if (rvol < 0.7) {
+        rvolAdjustment = Math.min(0.5, (1.0 - rvol) * 0.5);
+      }
+
+      // 6. Dynamic Z-Score threshold boundary clamping
+      const minThreshold = isShitcoin ? 0.6 : 1.2;
+      const maxThreshold = isShitcoin ? 2.0 : 2.8;
+      const dynamicZScoreThreshold = Math.max(
+        minThreshold,
+        Math.min(maxThreshold, baseZScoreThreshold + cvAdjustment + rvolAdjustment)
+      );
+
+      // Save to ref for downstream filtering alerts
+      dynamicZScoreThresholdRef.current = dynamicZScoreThreshold;
+
+      // 7. Core trigger logic replacing standard static standard deviations
+      const isTapeAccelerated =
+        tapeSpeedZScore > dynamicZScoreThreshold &&
+        tapeAcceleration > (isShitcoin ? 1.15 : 1.3);
+
+      // Replaces standard hardcoded 0.4, 0.25, and 0.08 thresholds dynamically
+      const cvdBreakoutThreshold = Math.max(isShitcoin ? 0.04 : 0.12, avgTickVol * 1.5 + 1.0 * tickVolStdDev);
+      const cvdAbsorptionThreshold = Math.max(isShitcoin ? 0.025 : 0.08, avgTickVol * 0.9 + 0.6 * tickVolStdDev);
+      const cvdFalseBreakoutThreshold = Math.max(isShitcoin ? 0.01 : 0.03, avgTickVol * 0.35 + 0.2 * tickVolStdDev);
+
+      // === SOLUTION B: INSTANT CROSSOVER MOMENTUM BREAKTHROUGH EXECUTION (FSM BYPASS) ===
+      let bypassPreciseEntry = false;
+      let crossoverTriggeredSide: "BUY" | "SELL" | null = null;
+      let crossoverTriggeredStrat: "BREAKOUT" | null = null;
+      let crossoverSignalMsg = "";
+      let crossoverNearestZone: any = null;
+
+      const prevPrice = prevPriceRef.current;
+      if (prevPrice > 0 && prevPrice !== newPrice && positionRef.current === null) {
+        // Find if we crossed any active, non-broken, non-predictive HTF or LTF zone
+        for (let i = 0; i < currentZones.length; i++) {
+          const z = currentZones[i];
+          if (
+            z.isBroken ||
+            z.type.startsWith("PRED LIQ") ||
+            z.type === "ACTIVE POS LIQ"
+          ) {
+            continue;
+          }
+
+          const zPrice = z.price;
+          const isSupport = z.type.includes("SUP") || z.type.includes("LOW") || z.type.includes("DEMAND");
+          const isResistance = z.type.includes("RES") || z.type.includes("HIGH") || z.type.includes("SUPPLY");
+
+          // support breach: prevPrice was above, newPrice is below or equal
+          const isSupportCrossDown = isSupport && prevPrice > zPrice && newPrice <= zPrice;
+          // resistance breach: prevPrice was below, newPrice is above or equal
+          const isResistanceCrossUp = isResistance && prevPrice < zPrice && newPrice >= zPrice;
+
+          if (isSupportCrossDown || isResistanceCrossUp) {
+            // Check for high-velocity breakthrough confirmation
+            const fsmScale = newPrice / 60000.0;
+            // Adaptive thresholds:
+            const meetsTapeSpeed = isTapeAccelerated || tapeAcceleration > 1.25;
+            const meetsCvd = isSupportCrossDown 
+              ? (cvdDelta < -cvdBreakoutThreshold * 0.45) 
+              : (cvdDelta > cvdBreakoutThreshold * 0.45);
+            const meetsImbalance = isSupportCrossDown
+              ? (orderbookImbalance < -0.05)
+              : (orderbookImbalance > 0.05);
+
+            if (meetsTapeSpeed && (meetsCvd || meetsImbalance)) {
+              crossoverTriggeredSide = isSupportCrossDown ? "SELL" : "BUY";
+              crossoverTriggeredStrat = "BREAKOUT";
+              bypassPreciseEntry = true;
+              crossoverNearestZone = z;
+              
+              const levelDesc = `${z.timeframe?.toUpperCase() || ""}-Level (${z.type})`;
+              if (isSupportCrossDown) {
+                crossoverSignalMsg = `⚡ [Solution B: Direct Crossover Breakthrough] Instant Entry activated! Price sliced downwards through support ${levelDesc} at $${zPrice.toFixed(1)} to $${newPrice.toFixed(1)}. Tape Accel: ${tapeAcceleration.toFixed(1)}x. Selling CVD Delta: ${cvdDelta.toFixed(2)}k. Bypassing FSM latency for zero slippage.`;
+              } else {
+                crossoverSignalMsg = `⚡ [Solution B: Direct Crossover Breakthrough] Instant Entry activated! Price sliced upwards through resistance ${levelDesc} at $${zPrice.toFixed(1)} to $${newPrice.toFixed(1)}. Tape Accel: ${tapeAcceleration.toFixed(1)}x. Buying CVD Delta: +${cvdDelta.toFixed(2)}k. Bypassing FSM latency for zero slippage.`;
+              }
+              break; // Trigger immediately on first crossed zone
+            }
+          }
         }
       }
 
-      oiRef.current += calculatedOiDelta;
+      // Update previous price for next tick tracking
+      prevPriceRef.current = newPrice;
 
-      // Clamp Open Interest to stay strictly within standard high-liquidity BTC futures boundaries ($1300M - $1450M) safely, with zero random noise
-      if (oiRef.current < 1300) oiRef.current = 1300;
-      if (oiRef.current > 1450) oiRef.current = 1450;
-      const openInterest = oiRef.current;
+      // Real-time tracking of BTC Futures Open Interest (OI)
+      // If we have an active real-time live connection message, do not simulate-overwrite, use live WS updates directly.
+      const isOiLiveActive = Date.now() - lastOiMsgTimeRef.current < 20000;
+      let openInterest = oiRef.current;
+      let oiDelta = 0;
 
-      const oiDelta = openInterest - prevOiRef.current;
-      prevOiRef.current = openInterest;
+      if (isOiLiveActive) {
+        oiDelta = openInterest - prevOiRef.current;
+        prevOiRef.current = openInterest;
+      } else {
+        // Fallback simulation when WS is inactive/down
+        let calculatedOiDelta = 0;
+        if (totalVolTick > 0) {
+          if (tapeSpeed > tapeSpeedBaseline + 1.5 * tapeSpeedStdDev || tapeAcceleration > 2.0) {
+            calculatedOiDelta = totalVolTick * 0.000004 * (cvdDelta > 0 ? 1 : -1);
+          } else {
+            calculatedOiDelta = totalVolTick * 0.0000008 * orderbookImbalance;
+          }
+        }
+        oiRef.current += calculatedOiDelta;
+
+        // Clamp Open Interest only under fallback simulation mode
+        if (oiRef.current < 1300) oiRef.current = 1300;
+        if (oiRef.current > 1450) oiRef.current = 1450;
+        openInterest = oiRef.current;
+
+        oiDelta = openInterest - prevOiRef.current;
+        prevOiRef.current = openInterest;
+      }
 
       // Reset trade count accumulator for next tick
       a.trades = 0;
@@ -1418,6 +1616,14 @@ export function useEngine() {
         // Already broken junior levels stay broken
         if (z.isBroken) return z;
 
+        // Prevent live tracking level from changing role (SUPPORT <-> RESIST) or breaking/disappearing
+        // while we are actively evaluating trades (ARMED or APPROACHING state) and "dancing" on support/resistance limit.
+        const isActiveInteractiveLevel = (stateRef.current === "ARMED" || stateRef.current === "APPROACHING") &&
+          nearestZoneIndex !== -1 &&
+          currentZones[nearestZoneIndex] &&
+          currentZones[nearestZoneIndex].price === z.price &&
+          currentZones[nearestZoneIndex].type === z.type;
+
         const isResistance = z.price >= newPrice;
         const currentIsResistance =
           z.type.includes("RESIST") || z.type.includes("HIGH");
@@ -1426,7 +1632,9 @@ export function useEngine() {
 
         // If a junior level (1m or 5m) was already crossed, keep it alive while near, but retire if price left the zone
         if ((z.timeframe === "1m" || z.timeframe === "5m") && z.hasBeenCrossed) {
-          if (distToLevel >= approachingThreshold) {
+          if (isActiveInteractiveLevel) {
+            // Keep active interactive levels alive to prevent FSM from losing context
+          } else if (distToLevel >= approachingThreshold) {
             anyZoneChanged = true;
             const timeStr = new Date().toLocaleTimeString("ru-RU");
             const criteria = [...(z.validationCriteria || [])];
@@ -1442,7 +1650,12 @@ export function useEngine() {
           }
         }
 
-        if (isResistance !== currentIsResistance) {
+        let shouldFlip = isResistance !== currentIsResistance;
+        if (isActiveInteractiveLevel) {
+          shouldFlip = false;
+        }
+
+        if (shouldFlip) {
           anyZoneChanged = true;
           const tfUpper = (z.timeframe || "1m").toUpperCase();
           let finalType = z.type;
@@ -1666,7 +1879,16 @@ export function useEngine() {
         )
           return;
 
-        const dist = Math.abs(z.price - newPrice);
+        let dist = 0;
+        const pLow = z.priceLow !== undefined ? z.priceLow : z.price;
+        const pHigh = z.priceHigh !== undefined ? z.priceHigh : z.price;
+        if (newPrice > pHigh) {
+          dist = newPrice - pHigh;
+        } else if (newPrice < pLow) {
+          dist = pLow - newPrice;
+        } else {
+          dist = 0;
+        }
         if (dist < minD) {
           minD = dist;
           nearestZoneIndex = idx;
@@ -1674,7 +1896,12 @@ export function useEngine() {
       });
 
       // FSM Engine Tick Rules
-      const prev = stateRef.current;
+      let prev = stateRef.current;
+      if (crossoverTriggeredSide && crossoverTriggeredStrat && prev !== "ARMED") {
+        setState("ARMED");
+        stateRef.current = "ARMED";
+        prev = "ARMED";
+      }
       let nextState = prev;
 
       // Adaptive FSM interaction thresholds are already defined at the top of handleTick
@@ -1695,10 +1922,15 @@ export function useEngine() {
         }
         // Advanced Entry Decision Matrix comparing tape speed velocity & cumulative delta volume
         else {
-          const nearestZone =
+          let nearestZone =
             nearestZoneIndex !== -1
               ? resolvedCurrentZones[nearestZoneIndex]
               : null;
+
+          if (crossoverTriggeredSide && crossoverNearestZone) {
+            nearestZone = crossoverNearestZone;
+          }
+
           const isNearResistance = nearestZone
             ? nearestZone.type.includes("RES") ||
               nearestZone.type.includes("HIGH")
@@ -1708,19 +1940,39 @@ export function useEngine() {
               nearestZone.type.includes("LOW")
             : false;
 
-          const isTapeAccelerated =
-            tapeAcceleration >
-            (configRef.current.filters.tapeSpeedMultiplier || 3.0);
+          let fbResistancePierceValid = false;
+          let fbSupportPierceValid = false;
 
-          let triggerEntrySide: "BUY" | "SELL" | null = null;
-          let chosenStratType: "BREAKOUT" | "ABSORPTION_FADE" | "FALSE_BREAKOUT" | null = null;
-          let signalMsg = "";
+          if (nearestZone) {
+            const zHigh = nearestZone.priceHigh ?? nearestZone.price;
+            const zLow = nearestZone.priceLow ?? nearestZone.price;
+            const fsmScale = newPrice / 60000.0;
+            const levelKey = `${nearestZone.type}_${nearestZone.price}`;
+            const tracker = levelPokeTrackerRef.current[levelKey];
+            const isFBPierced = !!(tracker && tracker.pierced);
 
-          if (isNearResistance && isTapeAccelerated && nearestZone) {
+            fbResistancePierceValid = configRef.current.execution.falseBreakoutDelayEnabled
+              ? (isFBPierced && newPrice < zHigh && newPrice >= zHigh - Math.max(8 * fsmScale, atrVal * 0.18))
+              : (newPrice >= zHigh - 2 * fsmScale && newPrice <= zHigh + Math.max(8 * fsmScale, atrVal * 0.18));
+
+            fbSupportPierceValid = configRef.current.execution.falseBreakoutDelayEnabled
+              ? (isFBPierced && newPrice > zLow && newPrice <= zLow + Math.max(8 * fsmScale, atrVal * 0.18))
+              : (newPrice <= zLow + 2 * fsmScale && newPrice >= zLow - Math.max(8 * fsmScale, atrVal * 0.18));
+          }
+
+          let triggerEntrySide: "BUY" | "SELL" | null = crossoverTriggeredSide;
+          let chosenStratType: "BREAKOUT" | "ABSORPTION_FADE" | "FALSE_BREAKOUT" | null = crossoverTriggeredStrat;
+          let signalMsg = crossoverSignalMsg;
+
+          if (crossoverTriggeredSide) {
+            // Bypass standard signal detection rules as we have a direct high-speed crossover trigger!
+          } else if (isNearResistance && isTapeAccelerated && nearestZone) {
+            const zHigh = nearestZone.priceHigh ?? nearestZone.price;
+            const zLow = nearestZone.priceLow ?? nearestZone.price;
+            
             // Option A: aggressive buying confirmation with OI growth & bid imbalance => TRUE BREAKOUT
-            const meetsCvdBreakout = cvdDelta > 0.4;
-            const isAboveOrAtLevel =
-              newPrice > nearestZone.price - atrVal * 0.05;
+            const meetsCvdBreakout = cvdDelta > cvdBreakoutThreshold;
+            const isAboveOrAtLevel = newPrice > zHigh - atrVal * 0.05;
             const meetsOiBreakout = oiDelta > -0.01;
             const meetsImbalanceBreakout = orderbookImbalance > 0.1;
             const meetsTrueBreakout =
@@ -1730,8 +1982,8 @@ export function useEngine() {
               isAboveOrAtLevel;
             const fsmScale = newPrice / 60000.0;
             const meetsAbsorptionFailureBreakout =
-              newPrice > nearestZone.price + Math.max(5 * fsmScale, atrVal * 0.08) &&
-              cvdDelta > 0.25 &&
+              newPrice > zHigh + Math.max(5 * fsmScale, atrVal * 0.08) &&
+              cvdDelta > cvdAbsorptionThreshold &&
               orderbookImbalance > 0.12 &&
               oiDelta > 0.005;
 
@@ -1739,28 +1991,33 @@ export function useEngine() {
               triggerEntrySide = "BUY";
               chosenStratType = "BREAKOUT";
               if (meetsTrueBreakout) {
-                signalMsg = `True Breakout confirmed at resistance ${nearestZone?.type || ""}. Speed Acceleration: ${tapeAcceleration.toFixed(1)}x. Strong buying CVD: +${cvdDelta.toFixed(2)}k. OI: +${oiDelta.toFixed(3)}M. Imbalance: +${(orderbookImbalance * 100).toFixed(1)}% bids.`;
+                signalMsg = `True Breakout confirmed at resistance high boundary $${zHigh.toFixed(1)} (${nearestZone?.type || ""}). Speed Acceleration: ${tapeAcceleration.toFixed(1)}x. Strong buying CVD: +${cvdDelta.toFixed(2)}k (adaptive threshold: +${cvdBreakoutThreshold.toFixed(2)}k). OI: +${oiDelta.toFixed(3)}M. Imbalance: +${(orderbookImbalance * 100).toFixed(1)}% bids.`;
               } else {
-                signalMsg = `Absorption Failure Squeeze triggered at resistance ${nearestZone?.type || ""}. Limit Ask Wall collapsed under intensive buying. CVD: +${cvdDelta.toFixed(2)}k. OI: +${oiDelta.toFixed(3)}M. Imbalance: +${(orderbookImbalance * 100).toFixed(1)}% bids.`;
+                signalMsg = `Absorption Failure Squeeze triggered at resistance high boundary $${zHigh.toFixed(1)} (${nearestZone?.type || ""}). Limit Ask Wall collapsed under intensive buying. CVD: +${cvdDelta.toFixed(2)}k (threshold: +${cvdAbsorptionThreshold.toFixed(2)}k). OI: +${oiDelta.toFixed(3)}M. Imbalance: +${(orderbookImbalance * 100).toFixed(1)}% bids.`;
               }
             }
             // Option C: False Breakout (Ложный Пробой) - Bull Trap (Counter-trend fade)
-            else if (
-              newPrice >= nearestZone.price - 2 * fsmScale &&
-              newPrice <= nearestZone.price + Math.max(8 * fsmScale, atrVal * 0.18) &&
-              (cvdDelta < -0.08 || orderbookImbalance < -0.05)
-            ) {
+            else if (fbResistancePierceValid && (cvdDelta < -cvdFalseBreakoutThreshold || orderbookImbalance < -0.05)) {
               triggerEntrySide = "SELL";
               chosenStratType = "FALSE_BREAKOUT";
-              signalMsg = `False Breakout (Bull Trap / ЛП) registered at resistance ${nearestZone?.type || ""}. Price peaked up to $${newPrice.toFixed(1)} (level $${nearestZone.price.toFixed(1)}) but failed to hold. Sellers reclaimed control: CVD Delta: ${cvdDelta.toFixed(2)}k. Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids. Handled optimally for Fee +0.1% targets.`;
+              const levelKey = `${nearestZone.type}_${nearestZone.price}`;
+              
+              if (configRef.current.execution.falseBreakoutDelayEnabled) {
+                const maxPrice = levelPokeTrackerRef.current[levelKey]?.maxPriceSeen || zHigh;
+                signalMsg = `False Breakout confirmed on Retrace Trigger (ЛП с возвратом под уровень) at resistance boundary $${zHigh.toFixed(1)} (${nearestZone?.type || ""}). Price poked up to $${maxPrice.toFixed(1)} and returned back to $${newPrice.toFixed(1)}. Sellers reclaimed control: CVD Delta: ${cvdDelta.toFixed(2)}k, Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids.`;
+                if (levelPokeTrackerRef.current[levelKey]) {
+                  levelPokeTrackerRef.current[levelKey].pierced = false;
+                }
+              } else {
+                signalMsg = `False Breakout (Bull Trap / ЛП) registered at resistance boundary $${zHigh.toFixed(1)} (${nearestZone?.type || ""}). Price poked up to $${newPrice.toFixed(1)} but failed to hold. Sellers reclaimed control: CVD Delta: ${cvdDelta.toFixed(2)}k. Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids. Handled optimally for Fee +0.1% targets.`;
+              }
             }
             // Option B: high transaction rate of buyers absorbed by passive limit sellers => ABSORPTION FADE
             else {
-              const isExhaustionFade = cvdDelta < -0.2;
-              const isActiveAbsorptionFade = cvdDelta > 0.2 && oiDelta > 0.01;
+              const isExhaustionFade = cvdDelta < -cvdAbsorptionThreshold;
+              const isActiveAbsorptionFade = cvdDelta > cvdAbsorptionThreshold && oiDelta > 0.01;
               const meetsImbalanceFade = orderbookImbalance < 0.25;
-              const isPriceHoldingResistance =
-                newPrice <= nearestZone.price + Math.max(5 * fsmScale, atrVal * 0.08);
+              const isPriceHoldingResistance = newPrice <= zHigh + Math.max(5 * fsmScale, atrVal * 0.08);
 
               if (
                 (isExhaustionFade || isActiveAbsorptionFade) &&
@@ -1770,18 +2027,20 @@ export function useEngine() {
                 triggerEntrySide = "SELL";
                 chosenStratType = "ABSORPTION_FADE";
                 signalMsg =
-                  `Absorption Fade triggered at resistance ${nearestZone?.type || ""}. ` +
+                  `Absorption Fade triggered inside resistance zone $${zLow.toFixed(1)} - $${zHigh.toFixed(1)} (${nearestZone?.type || ""}). ` +
                   (isActiveAbsorptionFade
-                    ? `Active Seller Limit Absorption: Buyers hit ask (CVD: +${cvdDelta.toFixed(2)}k) but price stalled. Fresh short OI accumulated: +${oiDelta.toFixed(3)}M.`
+                    ? `Active Seller Limit Absorption: Buyers hit ask (CVD: +${cvdDelta.toFixed(2)}k) but price stalled below boundary $${zHigh.toFixed(1)}. Fresh short OI accumulated: +${oiDelta.toFixed(3)}M.`
                     : `Aggressive Seller Backing: Tape accelerated but CVD buying exhausted to sell-off (CVD Delta: ${cvdDelta.toFixed(2)}k).`) +
-                  ` Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids. Price holding resistance.`;
+                  ` Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids. Price holding resistance boundary.`;
               }
             }
           } else if (isNearSupport && isTapeAccelerated && nearestZone) {
+            const zHigh = nearestZone.priceHigh ?? nearestZone.price;
+            const zLow = nearestZone.priceLow ?? nearestZone.price;
+
             // Option A: aggressive selling confirmation with OI growth & ask imbalance => TRUE BREAKOUT
-            const meetsCvdBreakout = cvdDelta < -0.4;
-            const isBelowOrAtLevel =
-              newPrice < nearestZone.price + atrVal * 0.05;
+            const meetsCvdBreakout = cvdDelta < -cvdBreakoutThreshold;
+            const isBelowOrAtLevel = newPrice < zLow + atrVal * 0.05;
             const meetsOiBreakout = oiDelta > -0.01;
             const meetsImbalanceBreakout = orderbookImbalance < -0.1;
             const meetsTrueBreakdown =
@@ -1791,8 +2050,8 @@ export function useEngine() {
               isBelowOrAtLevel;
             const fsmScale = newPrice / 60000.0;
             const meetsAbsorptionFailureBreakdown =
-              newPrice < nearestZone.price - Math.max(5 * fsmScale, atrVal * 0.08) &&
-              cvdDelta < -0.25 &&
+              newPrice < zLow - Math.max(5 * fsmScale, atrVal * 0.08) &&
+              cvdDelta < -cvdAbsorptionThreshold &&
               orderbookImbalance < -0.12 &&
               oiDelta > 0.005;
 
@@ -1800,28 +2059,33 @@ export function useEngine() {
               triggerEntrySide = "SELL";
               chosenStratType = "BREAKOUT";
               if (meetsTrueBreakdown) {
-                signalMsg = `True Breakdown confirmed at support ${nearestZone?.type || ""}. Speed Acceleration: ${tapeAcceleration.toFixed(1)}x. Strong selling CVD: ${cvdDelta.toFixed(2)}k. OI: +${oiDelta.toFixed(3)}M. Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids.`;
+                signalMsg = `True Breakdown confirmed at support low boundary $${zLow.toFixed(1)} (${nearestZone?.type || ""}). Speed Acceleration: ${tapeAcceleration.toFixed(1)}x. Strong selling CVD: ${cvdDelta.toFixed(2)}k (adaptive threshold: -${cvdBreakoutThreshold.toFixed(2)}k). OI: +${oiDelta.toFixed(3)}M. Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids.`;
               } else {
-                signalMsg = `Absorption Failure Breakdown triggered at support ${nearestZone?.type || ""}. Limit Bid Wall collapsed under heavy market dumps. CVD: ${cvdDelta.toFixed(2)}k. OI: +${oiDelta.toFixed(3)}M. Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids.`;
+                signalMsg = `Absorption Failure Breakdown triggered at support low boundary $${zLow.toFixed(1)} (${nearestZone?.type || ""}). Limit Bid Wall collapsed under heavy market dumps. CVD: ${cvdDelta.toFixed(2)}k (threshold: -${cvdAbsorptionThreshold.toFixed(2)}k). OI: +${oiDelta.toFixed(3)}M. Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids.`;
               }
             }
             // Option C: False Breakdown (Ложный Пробой) - Bear Trap (Counter-trend fade)
-            else if (
-              newPrice <= nearestZone.price + 2 * fsmScale &&
-              newPrice >= nearestZone.price - Math.max(8 * fsmScale, atrVal * 0.18) &&
-              (cvdDelta > 0.08 || orderbookImbalance > 0.05)
-            ) {
+            else if (fbSupportPierceValid && (cvdDelta > cvdFalseBreakoutThreshold || orderbookImbalance > 0.05)) {
               triggerEntrySide = "BUY";
               chosenStratType = "FALSE_BREAKOUT";
-              signalMsg = `False Breakdown (Bear Trap / ЛП) registered at support ${nearestZone?.type || ""}. Price poked down to $${newPrice.toFixed(1)} (level $${nearestZone.price.toFixed(1)}) but failed to hold. Buyers reclaimed control: CVD Delta: +${cvdDelta.toFixed(2)}k. Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids. Handled optimally for Fee +0.1% targets.`;
+              const levelKey = `${nearestZone.type}_${nearestZone.price}`;
+              
+              if (configRef.current.execution.falseBreakoutDelayEnabled) {
+                const minPrice = levelPokeTrackerRef.current[levelKey]?.minPriceSeen || zLow;
+                signalMsg = `False Breakdown confirmed on Retrace Trigger (ЛП с возвратом над уровень) at support boundary $${zLow.toFixed(1)} (${nearestZone?.type || ""}). Price poked down to $${minPrice.toFixed(1)} and returned back to $${newPrice.toFixed(1)}. Buyers reclaimed control: CVD Delta: +${cvdDelta.toFixed(2)}k, Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids.`;
+                if (levelPokeTrackerRef.current[levelKey]) {
+                  levelPokeTrackerRef.current[levelKey].pierced = false;
+                }
+              } else {
+                signalMsg = `False Breakdown (Bear Trap / ЛП) registered at support boundary $${zLow.toFixed(1)} (${nearestZone?.type || ""}). Price poked down to $${newPrice.toFixed(1)} but failed to hold. Buyers reclaimed control: CVD Delta: +${cvdDelta.toFixed(2)}k. Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids. Handled optimally for Fee +0.1% targets.`;
+              }
             }
             // Option B: high transaction rate of sellers absorbed by passive limit buyers => ABSORPTION FADE
             else {
-              const isExhaustionFade = cvdDelta > 0.2;
-              const isActiveAbsorptionFade = cvdDelta < -0.2 && oiDelta > 0.01;
+              const isExhaustionFade = cvdDelta > cvdAbsorptionThreshold;
+              const isActiveAbsorptionFade = cvdDelta < -cvdAbsorptionThreshold && oiDelta > 0.01;
               const meetsImbalanceFade = orderbookImbalance > -0.25;
-              const isPriceHoldingSupport =
-                newPrice >= nearestZone.price - Math.max(5 * fsmScale, atrVal * 0.08);
+              const isPriceHoldingSupport = newPrice >= zLow - Math.max(5 * fsmScale, atrVal * 0.08);
 
               if (
                 (isExhaustionFade || isActiveAbsorptionFade) &&
@@ -1831,17 +2095,17 @@ export function useEngine() {
                 triggerEntrySide = "BUY";
                 chosenStratType = "ABSORPTION_FADE";
                 signalMsg =
-                  `Absorption Fade triggered at support ${nearestZone?.type || ""}. ` +
+                  `Absorption Fade triggered inside support zone $${zLow.toFixed(1)} - $${zHigh.toFixed(1)} (${nearestZone?.type || ""}). ` +
                   (isActiveAbsorptionFade
-                    ? `Active Buyer Limit Absorption: Sellers dumped (CVD: +${cvdDelta.toFixed(2)}k) but support held firm ($${newPrice.toFixed(1)} vs level $${nearestZone.price.toFixed(1)}). Fresh long OI accumulated: +${oiDelta.toFixed(3)}M.`
+                    ? `Active Buyer Limit Absorption: Sellers dumped (CVD: +${cvdDelta.toFixed(2)}k) but support boundary $${zLow.toFixed(1)} held firm. Fresh long OI accumulated: +${oiDelta.toFixed(3)}M.`
                     : `Aggressive Buyer Backing: Tape accelerated but CVD selling exhausted to buying (CVD Delta: +${cvdDelta.toFixed(2)}k).`) +
-                  ` Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids. Price holding support.`;
+                  ` Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids. Price holding support boundary.`;
               }
             }
           }
 
           // === DEEP DATA ACCUMULATION FOR TRADING ENGINE [PRECISE ENTRY MODE] ===
-          if (configRef.current.execution.preciseEntryEnabled) {
+          if (configRef.current.execution.preciseEntryEnabled && !bypassPreciseEntry) {
             if (!armedAccumulatorRef.current) {
               armedAccumulatorRef.current = {
                 ticksCount: 0,
@@ -1864,9 +2128,57 @@ export function useEngine() {
               acc.entries.push({ side: triggerEntrySide, strat: chosenStratType });
             }
 
-            if (acc.ticksCount < 20) {
+            // --- OPTIMIZATION: FAST-TRACK ACCELERATION TRADING TRIGGER ---
+            // If we have collected at least 5 ticks (1.25s), and we have a very strong impulse
+            // (e.g., at least 3 identical signals pushed) AND tape speed acceleration is exceptional (>2.2x),
+            // we can trigger the trade immediately preventing negative price slippage.
+            let fastTrackTriggered = false;
+            let fastTrackSide: "BUY" | "SELL" | null = null;
+            let fastTrackStrat: "BREAKOUT" | "ABSORPTION_FADE" | "FALSE_BREAKOUT" | null = null;
+            let fastTrackReasons = "";
+
+            if (acc.ticksCount >= 5 && acc.entries.length >= 3) {
+              const countMap: Record<string, number> = {};
+              acc.entries.forEach(item => {
+                const key = `${item.side}_${item.strat}`;
+                countMap[key] = (countMap[key] || 0) + 1;
+              });
+
+              let maxKey = "";
+              let maxCount = 0;
+              Object.entries(countMap).forEach(([key, count]) => {
+                if (count > maxCount) {
+                  maxCount = count;
+                  maxKey = key;
+                }
+              });
+
+              if (maxCount >= 3) {
+                const [side, strat] = maxKey.split("_") as ["BUY" | "SELL", "BREAKOUT" | "ABSORPTION_FADE" | "FALSE_BREAKOUT"];
+                const currentAvgTapeSpeed = acc.tapeSpeedAcc / acc.ticksCount;
+                const netCvdAccum = acc.cvdDeltaAcc;
+
+                const isVeryFastTape = currentAvgTapeSpeed > 2.0;
+                const isExtremelyPositiveCvd = side === "BUY" && (strat === "BREAKOUT" ? netCvdAccum > 1.5 : netCvdAccum < -0.6);
+                const isExtremelyNegativeCvd = side === "SELL" && (strat === "BREAKOUT" ? netCvdAccum < -1.5 : netCvdAccum > 0.6);
+
+                if (isVeryFastTape && (isExtremelyPositiveCvd || isExtremelyNegativeCvd)) {
+                  fastTrackTriggered = true;
+                  fastTrackSide = side;
+                  fastTrackStrat = strat;
+                  fastTrackReasons = `⚡ [Fast-Track Acceleration] High conviction order-flow impulse detected over ${acc.ticksCount} ticks. Avg Tape Accel: ${currentAvgTapeSpeed.toFixed(1)}x, Net CVD: ${netCvdAccum.toFixed(2)}k. Speeding up execution to capture optimal entry.`;
+                }
+              }
+            }
+
+            if (fastTrackTriggered && fastTrackSide && fastTrackStrat) {
+              triggerEntrySide = fastTrackSide;
+              chosenStratType = fastTrackStrat;
+              signalMsg = fastTrackReasons;
+              armedAccumulatorRef.current = null; // Clear accumulator on execution
+            } else if (acc.ticksCount < 12) {
               // Standard behavior is to hold entry and accumulate a robust rolling statistical set
-              const progressMsg = `⏳ [Precise Entry] Analyzing Order Flow: Accumulating tick ${acc.ticksCount}/20 | Volatility index adjusted. Momentary CVD Change: ${cvdDelta >= 0 ? '+' : ''}${cvdDelta.toFixed(2)}k, Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids.`;
+              const progressMsg = `⏳ [Precise Entry] Analyzing Order Flow: Accumulating tick ${acc.ticksCount}/12 | Volatility index adjusted. Momentary CVD Change: ${cvdDelta >= 0 ? '+' : ''}${cvdDelta.toFixed(2)}k, Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids.`;
               
               if (acc.ticksCount % 4 === 1) {
                 setSignals((s) => [
@@ -1885,15 +2197,16 @@ export function useEngine() {
               triggerEntrySide = null;
               chosenStratType = null;
             } else {
-              // We have 20 ticks! Let's do the math-based consensus and smoothing
-              const avgTapeAcceleration = acc.tapeSpeedAcc / 20;
+              // We have 12 ticks! Let's do the math-based consensus and smoothing
+              const avgTapeAcceleration = acc.tapeSpeedAcc / 12;
               const netCvdDelta = acc.cvdDeltaAcc;
-              const avgImbalance = acc.obImbalanceAcc / 20;
+              const avgImbalance = acc.obImbalanceAcc / 12;
               const netOiDelta = acc.oiDeltaAcc;
 
               const totalSignalsCount = acc.entries.length;
               
-              if (totalSignalsCount >= 10) {
+              // We require at least 2 ticks with valid signal triggers over the 12-tick (3.0s) window
+              if (totalSignalsCount >= 2) {
                 const countMap: Record<string, number> = {};
                 acc.entries.forEach(item => {
                   const key = `${item.side}_${item.strat}`;
@@ -1909,80 +2222,63 @@ export function useEngine() {
                   }
                 });
 
-                if (maxCount >= 7) {
-                  const [side, strat] = maxKey.split("_") as ["BUY" | "SELL", "BREAKOUT" | "ABSORPTION_FADE" | "FALSE_BREAKOUT"];
-                  
-                  let mathematicallyConfirmed = false;
-                  let reasons = "";
+                const [side, strat] = maxKey.split("_") as ["BUY" | "SELL", "BREAKOUT" | "ABSORPTION_FADE" | "FALSE_BREAKOUT"];
+                
+                let mathematicallyConfirmed = false;
+                let reasons = "";
 
-                  if (side === "BUY") {
-                    if (strat === "BREAKOUT") {
-                      const meetsCvd = netCvdDelta > 2.0;
-                      const meetsImbalance = avgImbalance > 0.08;
-                      const meetsOi = netOiDelta > -0.02;
-                      if (meetsCvd && meetsImbalance && meetsOi) {
-                        mathematicallyConfirmed = true;
-                        reasons = `Sustained breakout confirmation (CVD: +${netCvdDelta.toFixed(2)}k over 5s, Avg Imbalance: +${(avgImbalance * 100).toFixed(1)}% bids, OI change: +${netOiDelta.toFixed(3)}M).`;
-                      }
-                    } else if (strat === "FALSE_BREAKOUT") {
-                      const meetsCvd = netCvdDelta < -0.375 || avgImbalance < -0.02;
-                      if (meetsCvd) {
-                        mathematicallyConfirmed = true;
-                        reasons = `Sustained bull-trap rejection detected over 5s window (Net CVD Delta: ${netCvdDelta.toFixed(2)}k).`;
-                      }
-                    } else if (strat === "ABSORPTION_FADE") {
-                      const meetsCvd = netCvdDelta < -1.0 || (netCvdDelta > 1.0 && netOiDelta > 0.02);
-                      const meetsImbalance = avgImbalance < 0.2;
-                      if (meetsCvd && meetsImbalance) {
-                        mathematicallyConfirmed = true;
-                        reasons = `Sustained resistance seller passive limit absorption confirmed (Net CVD: ${netCvdDelta.toFixed(2)}k, avg book imbalance: ${(avgImbalance * 100).toFixed(1)}% bids).`;
-                      }
+                if (side === "BUY") {
+                  if (strat === "BREAKOUT") {
+                    const meetsCvd = netCvdDelta > 1.2;
+                    const meetsImbalance = avgImbalance > 0.05;
+                    const meetsOi = netOiDelta > -0.03;
+                    if (meetsCvd && meetsImbalance && meetsOi) {
+                      mathematicallyConfirmed = true;
+                      reasons = `Sustained breakout confirmation (CVD: +${netCvdDelta.toFixed(2)}k over 3s, Avg Imbalance: +${(avgImbalance * 100).toFixed(1)}% bids, OI change: +${netOiDelta.toFixed(3)}M).`;
                     }
-                  } else if (side === "SELL") {
-                    if (strat === "BREAKOUT") {
-                      const meetsCvd = netCvdDelta < -2.0;
-                      const meetsImbalance = avgImbalance < -0.08;
-                      const meetsOi = netOiDelta > -0.02;
-                      if (meetsCvd && meetsImbalance && meetsOi) {
-                        mathematicallyConfirmed = true;
-                        reasons = `Sustained breakdown confirmation (CVD: ${netCvdDelta.toFixed(2)}k over 5s, Avg Imbalance: ${(avgImbalance * 100).toFixed(1)}% bids, OI change: +${netOiDelta.toFixed(3)}M).`;
-                      }
-                    } else if (strat === "FALSE_BREAKOUT") {
-                      const meetsCvd = netCvdDelta > 0.375 || avgImbalance > 0.02;
-                      if (meetsCvd) {
-                        mathematicallyConfirmed = true;
-                        reasons = `Sustained bear-trap rejection detected over 5s window (Net CVD Delta: +${netCvdDelta.toFixed(2)}k).`;
-                      }
-                    } else if (strat === "ABSORPTION_FADE") {
-                      const meetsCvd = netCvdDelta > 1.0 || (netCvdDelta < -1.0 && netOiDelta > 0.02);
-                      const meetsImbalance = avgImbalance > -0.2;
-                      if (meetsCvd && meetsImbalance) {
-                        mathematicallyConfirmed = true;
-                        reasons = `Sustained support buyer passive limit absorption confirmed (Net CVD: +${netCvdDelta.toFixed(2)}k, avg book imbalance: ${(avgImbalance * 100).toFixed(1)}% bids).`;
-                      }
+                  } else if (strat === "FALSE_BREAKOUT") {
+                    const meetsCvd = netCvdDelta < -0.2 || avgImbalance < -0.01;
+                    if (meetsCvd) {
+                      mathematicallyConfirmed = true;
+                      reasons = `Sustained bull-trap rejection detected over 3s window (Net CVD Delta: ${netCvdDelta.toFixed(2)}k).`;
+                    }
+                  } else if (strat === "ABSORPTION_FADE") {
+                    const meetsCvd = netCvdDelta < -0.6 || (netCvdDelta > 0.6 && netOiDelta > 0.01);
+                    const meetsImbalance = avgImbalance < 0.25;
+                    if (meetsCvd && meetsImbalance) {
+                      mathematicallyConfirmed = true;
+                      reasons = `Sustained resistance seller passive limit absorption confirmed (Net CVD: ${netCvdDelta.toFixed(2)}k, avg book imbalance: ${(avgImbalance * 100).toFixed(1)}% bids).`;
                     }
                   }
-
-                  if (mathematicallyConfirmed) {
-                    triggerEntrySide = side;
-                    chosenStratType = strat;
-                    signalMsg = `🎯 [Precise Entry Mode] ${strat} [${side}] confirmed. Data accumulated over 20 ticks (5.0s). ${reasons} Avg Speed: ${avgTapeAcceleration.toFixed(1)}x.`;
-                  } else {
-                    setSignals((s) => [
-                      {
-                        id: Math.random().toString(36).substr(2, 9),
-                        timestamp: new Date().toISOString(),
-                        type: "SYSTEM_ALERT",
-                        side: "NONE",
-                        price: newPrice,
-                        message: `❌ [Precise Entry] Entry blocked: Flow criteria did not persist/smooth cleanly over 5s accumulation. Net CVD Delta was ${netCvdDelta >= 0 ? '+' : ''}${netCvdDelta.toFixed(2)}k, Avg Imbalance: ${(avgImbalance * 100).toFixed(1)}%.`,
-                      },
-                      ...s,
-                    ].slice(0, 50));
-                    
-                    triggerEntrySide = null;
-                    chosenStratType = null;
+                } else if (side === "SELL") {
+                  if (strat === "BREAKOUT") {
+                    const meetsCvd = netCvdDelta < -1.2;
+                    const meetsImbalance = avgImbalance < -0.05;
+                    const meetsOi = netOiDelta > -0.03;
+                    if (meetsCvd && meetsImbalance && meetsOi) {
+                      mathematicallyConfirmed = true;
+                      reasons = `Sustained breakdown confirmation (CVD: ${netCvdDelta.toFixed(2)}k over 3s, Avg Imbalance: ${(avgImbalance * 100).toFixed(1)}% bids, OI change: +${netOiDelta.toFixed(3)}M).`;
+                    }
+                  } else if (strat === "FALSE_BREAKOUT") {
+                    const meetsCvd = netCvdDelta > 0.2 || avgImbalance > 0.01;
+                    if (meetsCvd) {
+                      mathematicallyConfirmed = true;
+                      reasons = `Sustained bear-trap rejection detected over 3s window (Net CVD Delta: +${netCvdDelta.toFixed(2)}k).`;
+                    }
+                  } else if (strat === "ABSORPTION_FADE") {
+                    const meetsCvd = netCvdDelta > 0.6 || (netCvdDelta < -0.6 && netOiDelta > 0.01);
+                    const meetsImbalance = avgImbalance > -0.25;
+                    if (meetsCvd && meetsImbalance) {
+                      mathematicallyConfirmed = true;
+                      reasons = `Sustained support buyer passive limit absorption confirmed (Net CVD: +${netCvdDelta.toFixed(2)}k, avg book imbalance: ${(avgImbalance * 100).toFixed(1)}% bids).`;
+                    }
                   }
+                }
+
+                if (mathematicallyConfirmed) {
+                  triggerEntrySide = side;
+                  chosenStratType = strat;
+                  signalMsg = `🎯 [Precise Entry Mode] ${strat} [${side}] confirmed. Data accumulated over 12 ticks (3.0s). ${reasons} Avg Speed: ${avgTapeAcceleration.toFixed(1)}x.`;
                 } else {
                   setSignals((s) => [
                     {
@@ -1991,11 +2287,11 @@ export function useEngine() {
                       type: "SYSTEM_ALERT",
                       side: "NONE",
                       price: newPrice,
-                      message: `❌ [Precise Entry] Entry blocked: No consistent flow strategy consensus over 5s window (occurrences map: ${JSON.stringify(countMap)}).`,
+                      message: `❌ [Precise Entry] Entry blocked: Flow criteria did not persist/smooth cleanly over 3s accumulation. Net CVD Delta was ${netCvdDelta >= 0 ? '+' : ''}${netCvdDelta.toFixed(2)}k, Avg Imbalance: ${(avgImbalance * 100).toFixed(1)}%.`,
                     },
                     ...s,
                   ].slice(0, 50));
-
+                  
                   triggerEntrySide = null;
                   chosenStratType = null;
                 }
@@ -2007,7 +2303,7 @@ export function useEngine() {
                     type: "SYSTEM_ALERT",
                     side: "NONE",
                     price: newPrice,
-                    message: `❌ [Precise Entry] Entry blocked: Order flow signals were too sporadic (${totalSignalsCount}/20 ticks had signals) to satisfy deep risk filtering.`,
+                    message: `❌ [Precise Entry] Entry blocked: Order flow signals were too sporadic (${totalSignalsCount}/12 ticks had signals) to satisfy deep risk filtering.`,
                   },
                   ...s,
                 ].slice(0, 50));
@@ -2031,14 +2327,16 @@ export function useEngine() {
               if (triggerEntrySide && chosenStratType && positionRef.current !== null) {
                 ignoredMsg = `🔍 Position Active: Ignored new ${chosenStratType} signal at ${nearestZone.type} ($${nearestZone.price.toFixed(1)}) because another ${positionRef.current.side} trade is already active.`;
               } else if (!triggerEntrySide) {
-                if (!isTapeAccelerated) {
-                  ignoredMsg = `🔍 Level Filtering: Rejected entry at ${nearestZone.type} ($${nearestZone.price.toFixed(1)}) - Tape speed (${tapeAcceleration.toFixed(1)}x) did not meet the required acceleration threshold (${(configRef.current.filters.tapeSpeedMultiplier || 3.0).toFixed(1)}x).`;
-                } else {
-                  // Tape speed was indeed high, but other rules failed
-                  if (isNearResistance) {
-                    ignoredMsg = `🔍 Level Filtering: Rejected resistance ${nearestZone.type} ($${nearestZone.price.toFixed(1)}) - Tape speed was ${(tapeAcceleration).toFixed(1)}x, but CVD Delta (${cvdDelta >= 0 ? '+' : ''}${cvdDelta.toFixed(2)}k) & Imbalance (${(orderbookImbalance * 100).toFixed(1)}% bids) did not meet breakout or absorption standards.`;
+                if (tradesCount > 0) {
+                  if (!isTapeAccelerated) {
+                    ignoredMsg = `🔍 Level Filtering: Rejected entry at ${nearestZone.type} ($${nearestZone.price.toFixed(1)}) - Tape speed (${tapeSpeed.toFixed(1)} tp/s, ${tapeAcceleration.toFixed(1)}x) did not meet dynamic ${dynamicZScoreThresholdRef.current.toFixed(2)}σ Z-score threshold (${(tapeSpeedBaseline + dynamicZScoreThresholdRef.current * tapeSpeedStdDev).toFixed(1)} tp/s).`;
                   } else {
-                    ignoredMsg = `🔍 Level Filtering: Rejected support ${nearestZone.type} ($${nearestZone.price.toFixed(1)}) - Tape speed was ${(tapeAcceleration).toFixed(1)}x, but selling pressure (CVD Delta: ${cvdDelta.toFixed(2)}k) & book imbalance (${(orderbookImbalance * 100).toFixed(1)}% bids) did not satisfy buy thresholds.`;
+                    // Tape speed was indeed high, but other rules failed
+                    if (isNearResistance) {
+                      ignoredMsg = `🔍 Level Filtering: Rejected resistance ${nearestZone.type} ($${nearestZone.price.toFixed(1)}) - Tape speed met standard-deviation threshold, but CVD Delta (${cvdDelta >= 0 ? '+' : ''}${cvdDelta.toFixed(2)}k, breakout threshold: +${cvdBreakoutThreshold.toFixed(2)}k) & Imbalance (${(orderbookImbalance * 100).toFixed(1)}% bids) did not satisfy breakout/absorption conditions.`;
+                    } else {
+                      ignoredMsg = `🔍 Level Filtering: Rejected support ${nearestZone.type} ($${nearestZone.price.toFixed(1)}) - Tape speed met standard-deviation threshold, but selling pressure (CVD Delta: ${cvdDelta.toFixed(2)}k, breakdown: -${cvdBreakoutThreshold.toFixed(2)}k) did not satisfy breakdown conditions.`;
+                    }
                   }
                 }
               }
@@ -2063,7 +2361,29 @@ export function useEngine() {
           }
 
           if (triggerEntrySide && chosenStratType) {
-            if (positionRef.current !== null) {
+            if (warmupSecondsLeftRef.current > 0) {
+              const checkKey = `${nearestZone?.price ?? 0}_warmup`;
+              const nowMs = Date.now();
+              const lastLogged = lastIgnoreLogTimeRef.current[checkKey] || 0;
+              if (nowMs - lastLogged > 10000) { // Log once per 10s
+                lastIgnoreLogTimeRef.current[checkKey] = nowMs;
+                setSignals((s) =>
+                  [
+                    {
+                      id: Math.random().toString(36).substr(2, 9),
+                      timestamp: new Date().toISOString(),
+                      type: "SYSTEM_ALERT",
+                      side: "NONE",
+                      price: newPrice,
+                      message: `⚠️ Warm-up active (${warmupSecondsLeftRef.current}s left). Standard deviation & Z-Score structures are normalizing. Automated entry blocked.`,
+                    },
+                    ...s,
+                  ].slice(0, 50),
+                );
+              }
+              triggerEntrySide = null;
+              chosenStratType = null;
+            } else if (positionRef.current !== null) {
               nextState = "POSITION_OPEN";
             } else {
               nextState = "EXECUTING";
@@ -2114,6 +2434,15 @@ export function useEngine() {
                 positionCvd: 0,
                 adverseTicksCount: 0,
                 adverseEnergy: 0,
+                zoneTouchActive: false,
+                zoneTouchPrice: 0,
+                zoneTouchType: "",
+                zoneAccumulatedCvd: 0,
+                zoneAccumulatedVolume: 0,
+                zoneTicksCount: 0,
+                zonePocHit: false,
+                zoneKey: nearestZone ? `${nearestZone.type}_${nearestZone.price}` : undefined,
+                positionTicksCount: 0,
               };
               setPosition(newPos);
 
@@ -2160,6 +2489,7 @@ export function useEngine() {
         // Auto close position under dynamic TP/SL targets based on entering strategy type
         const active = positionRef.current;
         if (active) {
+          const updatedPositionTicksCount = (active.positionTicksCount || 0) + 1;
           const diff = newPrice - active.entryPrice;
           const pathPnL = active.side === "BUY" ? diff : -diff;
 
@@ -2374,6 +2704,251 @@ export function useEngine() {
             }
           }
 
+          // 3.5 Zone Touch & POC Decision Evaluation Logic
+          let updatedZoneTouchActive = active.zoneTouchActive || false;
+          let updatedZoneTouchPrice = active.zoneTouchPrice || 0;
+          let updatedZoneTouchType = active.zoneTouchType || "";
+          let updatedZoneAccumulatedCvd = active.zoneAccumulatedCvd || 0;
+          let updatedZoneAccumulatedVolume = active.zoneAccumulatedVolume || 0;
+          let updatedZoneTicksCount = active.zoneTicksCount || 0;
+          let updatedZonePocHit = active.zonePocHit || false;
+
+          const zonesToSearch = (zonesRef.current || []);
+          const activeZone = zonesToSearch.find(z => {
+            const zLow = z.priceLow !== undefined ? z.priceLow : z.price;
+            const zHigh = z.priceHigh !== undefined ? z.priceHigh : z.price;
+            return newPrice >= zLow && newPrice <= zHigh;
+          });
+
+          let deciderExitTriggered = false;
+
+          if (activeZone) {
+            if (!updatedZoneTouchActive) {
+              updatedZoneTouchActive = true;
+              updatedZoneTouchPrice = activeZone.price;
+              updatedZoneTouchType = activeZone.type;
+              updatedZoneAccumulatedCvd = cvdDelta;
+              updatedZoneAccumulatedVolume = Math.abs(cvdDelta);
+              updatedZoneTicksCount = 1;
+              updatedZonePocHit = false;
+
+              setSignals((s) =>
+                [
+                  {
+                    id: Math.random().toString(36).substr(2, 9),
+                    timestamp: new Date().toISOString(),
+                    type: "SYSTEM_ALERT",
+                    side: active.side,
+                    price: newPrice,
+                    message: `🔍 [Zone Interaction] Entered ${activeZone.type} Zone @ $${activeZone.price.toFixed(1)} ($${(activeZone.priceLow ?? activeZone.price).toFixed(1)} - $${(activeZone.priceHigh ?? activeZone.price).toFixed(1)}). Commencing dynamic flow data accumulation...`
+                  },
+                  ...s,
+                ].slice(0, 50)
+              );
+            } else {
+              updatedZoneAccumulatedCvd += cvdDelta;
+              updatedZoneAccumulatedVolume += Math.abs(cvdDelta);
+              updatedZoneTicksCount += 1;
+
+              const previousPrice = prevPriceRef.current || active.entryPrice;
+              const pocPrice = updatedZoneTouchPrice;
+              const crossedPoc = (previousPrice <= pocPrice && newPrice >= pocPrice) || (previousPrice >= pocPrice && newPrice <= pocPrice);
+              const extremelyClosePoc = Math.abs(newPrice - pocPrice) <= (pocPrice * 0.0005);
+              
+              if ((crossedPoc || extremelyClosePoc) && !updatedZonePocHit) {
+                if (updatedZoneTicksCount < 30) {
+                  if (updatedZoneTicksCount % 4 === 1) {
+                    setSignals((s) => [
+                      {
+                        id: Math.random().toString(36).substr(2, 9),
+                        timestamp: new Date().toISOString(),
+                        type: "SYSTEM_ALERT",
+                        side: "NONE",
+                        price: newPrice,
+                        message: `⏳ [Decider Accumulating] Price near level POC @ $${pocPrice.toFixed(1)}. Ticks inside: ${updatedZoneTicksCount}/30. Acc. CVD: ${updatedZoneAccumulatedCvd.toFixed(2)}k. Decision deferred to process complete dataset and prevent premature stop-out.`
+                      },
+                      ...s,
+                    ].slice(0, 50));
+                  }
+                } else {
+                  const isEntryZone = active.zoneKey === `${activeZone.type}_${activeZone.price}`;
+                  const isVeryYoung = updatedPositionTicksCount < 24;
+                  
+                  if (isVeryYoung && isEntryZone) {
+                    if (updatedZoneTicksCount === 30) {
+                      setSignals((s) => [
+                        {
+                          id: Math.random().toString(36).substr(2, 9),
+                          timestamp: new Date().toISOString(),
+                          type: "SYSTEM_ALERT",
+                          side: active.side,
+                          price: newPrice,
+                          message: `🛡️ [Decider Standby] Position is young (${updatedPositionTicksCount} ticks). Entry level ${activeZone.type} @ $${activeZone.price.toFixed(1)} is protected from pre-emptive stop-outs. Allowing trade to develop.`
+                        },
+                        ...s,
+                      ].slice(0, 50));
+                    }
+                  } else {
+                    updatedZonePocHit = true;
+                    
+                    if (configRef.current.execution.zoneTouchPocDeciderEnabled) {
+                      const isBuySide = active.side === "BUY";
+                      // Opposing zones: Resistance/Supply/High for BUY, Support/Demand/Low for SELL
+                      const isOpposingZone = isBuySide 
+                        ? (updatedZoneTouchType.includes("RES") || updatedZoneTouchType.includes("SUPPLY") || updatedZoneTouchType.includes("HIGH"))
+                        : (updatedZoneTouchType.includes("SUPP") || updatedZoneTouchType.includes("DEMAND") || updatedZoneTouchType.includes("LOW"));
+
+                      const isSupportingZone = isBuySide
+                        ? (updatedZoneTouchType.includes("SUPP") || updatedZoneTouchType.includes("DEMAND") || updatedZoneTouchType.includes("LOW"))
+                        : (updatedZoneTouchType.includes("RES") || updatedZoneTouchType.includes("SUPPLY") || updatedZoneTouchType.includes("HIGH"));
+
+                      const flowPower = updatedZoneAccumulatedCvd;
+                      
+                      if (isOpposingZone) {
+                        const flowOpposesBreakout = isBuySide ? (flowPower < -1.0) : (flowPower > 1.0);
+                        const flowSupportsBreakout = isBuySide ? (flowPower > 1.5) : (flowPower < -1.5);
+                        
+                        if (flowOpposesBreakout) {
+                          const protectionReason = isBuySide 
+                            ? `⚠️ [Active POC Decision] Heavy bearish pressure at opposing Resistance POC (Flow CVD: ${flowPower.toFixed(2)}k). Position unchanged; relying on standard stop-loss.`
+                            : `⚠️ [Active POC Decision] Heavy bullish pressure at opposing Support POC (Flow CVD: +${flowPower.toFixed(2)}k). Position unchanged; relying on standard stop-loss.`;
+                          
+                          setSignals((s) =>
+                            [
+                              {
+                                id: Math.random().toString(36).substr(2, 9),
+                                timestamp: new Date().toISOString(),
+                                type: "SYSTEM_ALERT",
+                                side: active.side,
+                                price: newPrice,
+                                message: protectionReason,
+                              },
+                              ...s,
+                            ].slice(0, 50)
+                          );
+                        } else if (flowSupportsBreakout) {
+                          const successReason = isBuySide
+                            ? `🔥 [Active POC Decision] Breakout confirmed! Strong buying CVD (${flowPower.toFixed(2)}k) breaching opposing Resistance. Target TP extended +30%!`
+                            : `🔥 [Active POC Decision] Breakdown confirmed! Strong selling CVD (${flowPower.toFixed(2)}k) breaching opposing Support. Target TP extended +30%!`;
+                          
+                          if (updatedTpPrice) {
+                            const targetDiff = Math.abs(updatedTpPrice - active.entryPrice);
+                            updatedTpPrice = isBuySide ? updatedTpPrice + targetDiff * 0.3 : updatedTpPrice - targetDiff * 0.3;
+                          }
+
+                          setSignals((s) =>
+                            [
+                              {
+                                id: Math.random().toString(36).substr(2, 9),
+                                timestamp: new Date().toISOString(),
+                                type: "SYSTEM_ALERT",
+                                side: active.side,
+                                price: newPrice,
+                                message: successReason,
+                              },
+                              ...s,
+                            ].slice(0, 50)
+                          );
+                        } else {
+                          const neutralMsg = `⚡ [Active POC Decision] Near opposing POC. Equilibrium flow (Acc. CVD: ${flowPower.toFixed(2)}k). Let trade develop.`;
+                          setSignals((s) =>
+                            [
+                              {
+                                id: Math.random().toString(36).substr(2, 9),
+                                timestamp: new Date().toISOString(),
+                                type: "SYSTEM_ALERT",
+                                side: "NONE",
+                                price: newPrice,
+                                message: neutralMsg,
+                              },
+                              ...s,
+                            ].slice(0, 50)
+                          );
+                        }
+                      } else if (isSupportingZone) {
+                        const flowSupportsHold = isBuySide ? (flowPower > 0.8) : (flowPower < -0.8);
+                        const flowFailsHold = isBuySide ? (flowPower < -1.5) : (flowPower > 1.5);
+
+                        if (flowFailsHold) {
+                          const emergencyExitReason = isBuySide
+                            ? `🚨 [Active POC Decision] Support level POC collapsed under severe selling CVD (${flowPower.toFixed(2)}k). Relying on standard Stop Loss; pre-emptive exits are disabled.`
+                            : `🚨 [Active POC Decision] Resistance level POC breached under severe buying CVD (+${flowPower.toFixed(2)}k). Relying on standard Stop Loss; pre-emptive exits are disabled.`;
+                          
+                          setSignals((s) =>
+                            [
+                              {
+                                id: Math.random().toString(36).substr(2, 9),
+                                timestamp: new Date().toISOString(),
+                                type: "SYSTEM_ALERT",
+                                side: active.side,
+                                price: newPrice,
+                                message: emergencyExitReason,
+                              },
+                              ...s,
+                            ].slice(0, 50)
+                          );
+                        } else if (flowSupportsHold) {
+                          const reboundReason = isBuySide
+                            ? `📈 [Active POC Decision] Strong passive absorption holding Support POC (Acc. CVD: +${flowPower.toFixed(2)}k). Position stabilized.`
+                            : `📈 [Active POC Decision] Strong passive absorption holding Resistance POC (Acc. CVD: ${flowPower.toFixed(2)}k). Position stabilized.`;
+                          
+                          setSignals((s) =>
+                            [
+                              {
+                                id: Math.random().toString(36).substr(2, 9),
+                                timestamp: new Date().toISOString(),
+                                type: "SYSTEM_ALERT",
+                                side: active.side,
+                                price: newPrice,
+                                message: reboundReason,
+                              },
+                              ...s,
+                            ].slice(0, 50)
+                          );
+                        }
+                      }
+                    } else {
+                      setSignals((s) =>
+                        [
+                          {
+                            id: Math.random().toString(36).substr(2, 9),
+                            timestamp: new Date().toISOString(),
+                            type: "SYSTEM_ALERT",
+                            side: "NONE",
+                            price: newPrice,
+                            message: `🎯 Touched Zone POC @ $${pocPrice.toFixed(1)} [Decider Disabled]. Acc. CVD: ${updatedZoneAccumulatedCvd.toFixed(2)}k, ticks inside: ${updatedZoneTicksCount}.`
+                          },
+                          ...s,
+                        ].slice(0, 50)
+                      );
+                    }
+                  }
+                }
+              }
+            }
+          } else {
+            if (updatedZoneTouchActive) {
+              setSignals((s) =>
+                [
+                  {
+                    id: Math.random().toString(36).substr(2, 9),
+                    timestamp: new Date().toISOString(),
+                    type: "SYSTEM_ALERT",
+                    side: "NONE",
+                    price: newPrice,
+                    message: `🚪 [Zone Interaction] Exited ${updatedZoneTouchType} Zone boundaries. Final accrued CVD: ${updatedZoneAccumulatedCvd.toFixed(2)}k over ${updatedZoneTicksCount} ticks.`
+                  },
+                  ...s,
+                ].slice(0, 50)
+              );
+              updatedZoneTouchActive = false;
+            }
+          }
+
+          if (deciderExitTriggered) {
+            return;
+          }
+
           // Save structural and real-time cumulative updates to the active position
           setPosition({
             ...active,
@@ -2385,6 +2960,14 @@ export function useEngine() {
             positionCvd: updatedPositionCvd,
             adverseTicksCount: updatedAdverseTicksCount,
             adverseEnergy: updatedAdverseEnergy,
+            zoneTouchActive: updatedZoneTouchActive,
+            zoneTouchPrice: updatedZoneTouchPrice,
+            zoneTouchType: updatedZoneTouchType,
+            zoneAccumulatedCvd: updatedZoneAccumulatedCvd,
+            zoneAccumulatedVolume: updatedZoneAccumulatedVolume,
+            zoneTicksCount: updatedZoneTicksCount,
+            zonePocHit: updatedZonePocHit,
+            positionTicksCount: updatedPositionTicksCount,
           });
 
           // 4. Opposing Signal / Technical Exit (including cumulative adverse pressure)
@@ -2440,20 +3023,16 @@ export function useEngine() {
                 ? nearestZone.type.includes("SUP") ||
                   nearestZone.type.includes("LOW")
                 : false;
-              const isTapeAccelerated =
-                tapeAcceleration >
-                (configRef.current.filters.tapeSpeedMultiplier || 3.0);
-
               if (active.side === "BUY") {
                 const isOpposingAbsorption =
-                  isNearResistance && isTapeAccelerated && cvdDelta < -0.2;
+                  isNearResistance && isTapeAccelerated && cvdDelta < -cvdAbsorptionThreshold;
                 const isOpposingBreakout =
-                  isNearSupport && isTapeAccelerated && cvdDelta < -0.4;
+                  isNearSupport && isTapeAccelerated && cvdDelta < -cvdBreakoutThreshold;
                 if (isOpposingAbsorption || isOpposingBreakout) {
                   hasOpposingSignalExit = true;
                   const reason = isOpposingAbsorption
-                    ? `Large seller absorption detected at resistance (${nearestZone?.type || ""}) with CVD Delta ${cvdDelta.toFixed(2)}k`
-                    : `Opposing breakdown breakout triggered at support (${nearestZone?.type || ""}) with CVD Delta ${cvdDelta.toFixed(2)}k`;
+                    ? `Large seller absorption detected at resistance (${nearestZone?.type || ""}) with CVD Delta ${cvdDelta.toFixed(2)}k (threshold: -${cvdAbsorptionThreshold.toFixed(2)}k)`
+                    : `Opposing breakdown breakout triggered at support (${nearestZone?.type || ""}) with CVD Delta ${cvdDelta.toFixed(2)}k (threshold: -${cvdBreakoutThreshold.toFixed(2)}k)`;
 
                   setSignals((s) =>
                     [
@@ -2471,14 +3050,14 @@ export function useEngine() {
                 }
               } else {
                 const isOpposingAbsorption =
-                  isNearSupport && isTapeAccelerated && cvdDelta > 0.2;
+                  isNearSupport && isTapeAccelerated && cvdDelta > cvdAbsorptionThreshold;
                 const isOpposingBreakout =
-                  isNearResistance && isTapeAccelerated && cvdDelta > 0.4;
+                  isNearResistance && isTapeAccelerated && cvdDelta > cvdBreakoutThreshold;
                 if (isOpposingAbsorption || isOpposingBreakout) {
                   hasOpposingSignalExit = true;
                   const reason = isOpposingAbsorption
-                    ? `Passive buyer absorption detected at support (${nearestZone?.type || ""}) with CVD Delta +${cvdDelta.toFixed(2)}k`
-                    : `Opposing breakout triggered at resistance (${nearestZone?.type || ""}) with CVD Delta +${cvdDelta.toFixed(2)}k`;
+                    ? `Passive buyer absorption detected at support (${nearestZone?.type || ""}) with CVD Delta +${cvdDelta.toFixed(2)}k (threshold: +${cvdAbsorptionThreshold.toFixed(2)}k)`
+                    : `Opposing breakout triggered at resistance (${nearestZone?.type || ""}) with CVD Delta +${cvdDelta.toFixed(2)}k (threshold: +${cvdBreakoutThreshold.toFixed(2)}k)`;
 
                   setSignals((s) =>
                     [
@@ -2614,6 +3193,7 @@ export function useEngine() {
         );
       } else {
         setState("SCANNING");
+        setWarmupSecondsLeft(60);
       }
       return !h;
     });
@@ -2683,6 +3263,14 @@ export function useEngine() {
       positionCvd: 0,
       adverseTicksCount: 0,
       adverseEnergy: 0,
+      zoneTouchActive: false,
+      zoneTouchPrice: 0,
+      zoneTouchType: "",
+      zoneAccumulatedCvd: 0,
+      zoneAccumulatedVolume: 0,
+      zoneTicksCount: 0,
+      zonePocHit: false,
+      positionTicksCount: 0,
     };
     setPosition(newPos);
     setState("POSITION_OPEN");
@@ -2794,5 +3382,6 @@ export function useEngine() {
     completedTradesCount,
     formatPrice,
     formatQty,
+    warmupSecondsLeft,
   };
 }
