@@ -2,12 +2,34 @@ import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import WebSocketClient from "ws";
+import { GoogleGenAI } from "@google/genai";
 
 const app = express();
+app.use(express.json());
 const PORT = 3000;
+
+let aiClient: GoogleGenAI | null = null;
+function getGeminiClient(): GoogleGenAI {
+  if (!aiClient) {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) {
+      throw new Error("GEMINI_API_KEY environment variable is required");
+    }
+    aiClient = new GoogleGenAI({
+      apiKey: key,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build'
+        }
+      }
+    });
+  }
+  return aiClient;
+}
 
 interface SseClient {
   res: express.Response;
+  symbol: string;
 }
 
 interface LogEntry {
@@ -24,180 +46,239 @@ function addLog(level: string, message: string) {
 }
 
 let clients: SseClient[] = [];
-let binanceWs: WebSocketClient | null = null;
-let currentWsUrl = "";
-let lastWebSocketMessageTime = 0;
-let lastPolledPrice = 0;
-let activeSymbol = "btcusdt";
-let disconnectBinanceFeed: (() => void) | null = null;
 
-// Server-side subscriber to Binance Futures
-function connectBinance(symbol = "btcusdt") {
+// Active WebSocket connections mapped by symbol
+interface ActiveFeed {
+  ws: WebSocketClient | null;
+  clientsCount: number;
+  lastMessageTime: number;
+  lastPolledPrice: number;
+  wsUrl: string;
+  reconnectTimeout: NodeJS.Timeout | null;
+  connTimeout: NodeJS.Timeout | null;
+  active: boolean;
+  tradeBuffer: any[];
+  batchInterval: NodeJS.Timeout | null;
+}
+
+const activeFeeds = new Map<string, ActiveFeed>();
+
+// Broadcast to SSE clients subscribed to a specific symbol
+function broadcastToSymbol(symbol: string, data: string | object, isRawString = false) {
+  const payload = isRawString ? (data as string) : JSON.stringify(data);
   const symbolLower = symbol.toLowerCase().trim();
+  clients.forEach((client) => {
+    if (client.symbol === symbolLower) {
+      try {
+        client.res.write(`data: ${payload}\n\n`);
+        if (typeof (client.res as any).flush === 'function') {
+          (client.res as any).flush();
+        }
+      } catch (e) {
+        // stale client
+      }
+    }
+  });
+}
+
+// Server-side subscriber to Binance Futures (Multiplexed)
+function startFeed(symbol: string) {
+  const symbolLower = symbol.toLowerCase().trim();
+  if (activeFeeds.has(symbolLower)) {
+    const feed = activeFeeds.get(symbolLower)!;
+    feed.clientsCount++;
+    addLog("INFO", `[Mux] Registered client for existing feed: ${symbolLower.toUpperCase()} (Total: ${feed.clientsCount})`);
+    return;
+  }
+
+  addLog("INFO", `[Mux] Initializing new multiplexed feed for symbol: ${symbolLower.toUpperCase()}`);
+
+  const feed: ActiveFeed = {
+    ws: null,
+    clientsCount: 1,
+    lastMessageTime: 0,
+    lastPolledPrice: 0,
+    wsUrl: "",
+    reconnectTimeout: null,
+    connTimeout: null,
+    active: true,
+    tradeBuffer: [],
+    batchInterval: null
+  };
+  activeFeeds.set(symbolLower, feed);
+
+  feed.batchInterval = setInterval(() => {
+    if (feed.tradeBuffer.length > 0) {
+      broadcastToSymbol(symbolLower, feed.tradeBuffer);
+      feed.tradeBuffer = [];
+    }
+  }, 200);
+
   const wsEndpoints = [
-    `wss://fstream.binanceapi.com/stream?streams=${symbolLower}@aggTrade/${symbolLower}@openInterest`,
-    `wss://fstream.binance.me/stream?streams=${symbolLower}@aggTrade/${symbolLower}@openInterest`,
-    `wss://fstream.binance.cc/stream?streams=${symbolLower}@aggTrade/${symbolLower}@openInterest`,
-    `wss://fstream.binance.com/stream?streams=${symbolLower}@aggTrade/${symbolLower}@openInterest`
+    `wss://fstream.binanceapi.com/stream?streams=${symbolLower}@aggTrade/${symbolLower}@depth20`,
+    `wss://fstream.binance.me/stream?streams=${symbolLower}@aggTrade/${symbolLower}@depth20`,
+    `wss://fstream.binance.cc/stream?streams=${symbolLower}@aggTrade/${symbolLower}@depth20`,
+    `wss://fstream.binance.com/stream?streams=${symbolLower}@aggTrade/${symbolLower}@depth20`
   ];
   let endpointIndex = 0;
-  let active = true;
-  let reconnectTimeout: NodeJS.Timeout | null = null;
-  let connTimeout: NodeJS.Timeout | null = null;
 
   function attempt() {
-    if (!active) return;
+    if (!feed.active) return;
 
-    if (reconnectTimeout) clearTimeout(reconnectTimeout);
-    if (connTimeout) clearTimeout(connTimeout);
+    if (feed.reconnectTimeout) clearTimeout(feed.reconnectTimeout);
+    if (feed.connTimeout) clearTimeout(feed.connTimeout);
 
     const targetUrl = wsEndpoints[endpointIndex % wsEndpoints.length];
-    currentWsUrl = targetUrl;
-    addLog("INFO", `Connecting to Binance WebSocket: ${targetUrl}`);
+    feed.wsUrl = targetUrl;
+    addLog("INFO", `[${symbolLower.toUpperCase()}] Connecting WS: ${targetUrl}`);
 
     try {
-      binanceWs = new WebSocketClient(targetUrl);
+      const ws = new WebSocketClient(targetUrl);
+      feed.ws = ws;
 
-      // Timeout if connection doesn't open
-      connTimeout = setTimeout(() => {
-        if (binanceWs && binanceWs.readyState !== WebSocketClient.OPEN) {
-          addLog("WARN", `Connection timeout on ${targetUrl}, rotating...`);
-          binanceWs.terminate();
+      feed.connTimeout = setTimeout(() => {
+        if (ws && ws.readyState !== WebSocketClient.OPEN) {
+          addLog("WARN", `[${symbolLower.toUpperCase()}] Timeout on ${targetUrl}, rotating...`);
+          try { ws.terminate(); } catch (e) {}
           rotate();
         }
       }, 5000);
 
-      binanceWs.on("open", () => {
-        if (connTimeout) clearTimeout(connTimeout);
-        addLog("INFO", `Binance WebSocket connection successfully established to ${targetUrl}`);
-        // Keep-alive notify on channel
-        broadcast({ type: "ws_status", status: `OK [${symbol.toUpperCase()}]`, url: targetUrl });
+      ws.on("open", () => {
+        if (feed.connTimeout) clearTimeout(feed.connTimeout);
+        addLog("INFO", `[${symbolLower.toUpperCase()}] WS connected to ${targetUrl}`);
+        broadcastToSymbol(symbolLower, { type: "ws_status", status: `OK [${symbolLower.toUpperCase()}]`, url: targetUrl });
       });
 
-      binanceWs.on("message", (rawData) => {
-        lastWebSocketMessageTime = Date.now();
+      ws.on("message", (rawData) => {
         try {
-          const payloadString = rawData.toString();
-          broadcast(payloadString, true);
+          const parsed = JSON.parse(rawData.toString());
+          const innerEvent = parsed.data || parsed;
+          if (innerEvent && innerEvent.e === "aggTrade") {
+            feed.lastMessageTime = Date.now();
+            feed.tradeBuffer.push(parsed);
+          } else {
+            // Non-trade data (like depth20) is broadcast immediately
+            broadcastToSymbol(symbolLower, parsed);
+          }
         } catch (e) {
-          // Skip corrupt frame
+          // ignore corrupt frame
         }
       });
 
-      binanceWs.on("error", (err) => {
-        addLog("ERROR", `WebSocket Error on ${targetUrl}: ${err.message || String(err)}`);
+      ws.on("error", (err) => {
+        addLog("ERROR", `[${symbolLower.toUpperCase()}] WS Error: ${err.message || String(err)}`);
       });
 
-      binanceWs.on("close", (code, reason) => {
-        if (connTimeout) clearTimeout(connTimeout);
-        addLog("WARN", `Binance WebSocket closed from ${targetUrl} (Code: ${code}, Reason: ${reason || "none"}), rotating...`);
+      ws.on("close", (code, reason) => {
+        if (feed.connTimeout) clearTimeout(feed.connTimeout);
+        addLog("WARN", `[${symbolLower.toUpperCase()}] WS closed (Code: ${code}, Reason: ${reason || "none"}), rotating...`);
         rotate();
       });
 
     } catch (err: any) {
-      addLog("ERROR", `Connection setup threw for ${targetUrl}: ${err.message || String(err)}`);
+      addLog("ERROR", `[${symbolLower.toUpperCase()}] Setup threw: ${err.message || String(err)}`);
       rotate();
     }
   }
 
   function rotate() {
-    if (!active) return;
+    if (!feed.active) return;
     endpointIndex++;
-    broadcast({ type: "ws_status", status: "RECONNECTING" });
-    reconnectTimeout = setTimeout(attempt, 3000);
+    broadcastToSymbol(symbolLower, { type: "ws_status", status: "RECONNECTING" });
+    feed.reconnectTimeout = setTimeout(attempt, 3000);
   }
 
   attempt();
+}
 
-  return () => {
-    active = false;
-    if (binanceWs) {
-      binanceWs.terminate();
+function stopFeed(symbol: string) {
+  const symbolLower = symbol.toLowerCase().trim();
+  const feed = activeFeeds.get(symbolLower);
+  if (!feed) return;
+
+  feed.clientsCount--;
+  addLog("INFO", `[Mux] Client unsubscribed from ${symbolLower.toUpperCase()} (Remaining: ${feed.clientsCount})`);
+
+  if (feed.clientsCount <= 0) {
+    addLog("INFO", `[Mux] Cleaning up unused active feed connection for: ${symbolLower.toUpperCase()}`);
+    feed.active = false;
+    if (feed.ws) {
+      try { feed.ws.terminate(); } catch (e) {}
     }
-    if (reconnectTimeout) clearTimeout(reconnectTimeout);
-    if (connTimeout) clearTimeout(connTimeout);
-  };
+    if (feed.reconnectTimeout) clearTimeout(feed.reconnectTimeout);
+    if (feed.connTimeout) clearTimeout(feed.connTimeout);
+    if (feed.batchInterval) clearInterval(feed.batchInterval);
+    activeFeeds.delete(symbolLower);
+  }
 }
 
 // Fallback REST Poller to keep chart updated if WS is blocked/down
 async function pollFallbackPrice() {
-  // If we received a WS message in the last 4 seconds, we don't need to poll REST
-  if (Date.now() - lastWebSocketMessageTime < 4000) {
-    return;
-  }
+  for (const [symbolLower, feed] of activeFeeds.entries()) {
+    // If we received a WS message in the last 4 seconds, we don't need to poll REST for this symbol
+    if (Date.now() - feed.lastMessageTime < 4000) {
+      continue;
+    }
 
-  const symbolUpper = activeSymbol.toUpperCase();
-  const endpoints = [
-    `https://fapi.binanceapi.com/fapi/v1/ticker/price?symbol=${symbolUpper}`,
-    `https://fapi.binance.me/fapi/v1/ticker/price?symbol=${symbolUpper}`,
-    `https://fapi.binance.cc/fapi/v1/ticker/price?symbol=${symbolUpper}`,
-    `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbolUpper}`
-  ];
+    const symbolUpper = symbolLower.toUpperCase();
+    const endpoints = [
+      `https://fapi.binanceapi.com/fapi/v1/ticker/price?symbol=${symbolUpper}`,
+      `https://fapi.binance.me/fapi/v1/ticker/price?symbol=${symbolUpper}`,
+      `https://fapi.binance.cc/fapi/v1/ticker/price?symbol=${symbolUpper}`,
+      `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbolUpper}`
+    ];
 
-  for (const url of endpoints) {
-    try {
-      const response = await fetch(url);
-      if (response.ok) {
-        const data = await response.json() as { symbol: string; price: string };
-        const price = parseFloat(data.price);
-        if (!isNaN(price)) {
-          if (price !== lastPolledPrice) {
-            lastPolledPrice = price;
+    for (const url of endpoints) {
+      try {
+        const response = await fetch(url);
+        if (response.ok) {
+          const data = await response.json() as { symbol: string; price: string };
+          const price = parseFloat(data.price);
+          if (!isNaN(price)) {
+            if (price !== feed.lastPolledPrice) {
+              feed.lastPolledPrice = price;
+            }
+            // Notify client we're using fallback polling
+            broadcastToSymbol(symbolLower, { type: "ws_status", status: `OK [FALLBACK POLLED - ${symbolUpper}]`, url: "REST API fallback" });
+
+            // Generate simulated active trade flow using the actual live price
+            const randomTradesCount = Math.floor(Math.random() * 5) + 2; // 2 to 6 simulated micro-trades
+            for (let i = 0; i < randomTradesCount; i++) {
+              const spreadOffset = (Math.random() - 0.5) * (price * 0.00008); // dynamic micro-jitter
+              const microPrice = price + spreadOffset;
+              const size = Math.random() * 0.4 + 0.01;
+              const isMakerBuyer = Math.random() > 0.5;
+
+              // Determine formatting precision based on price scale
+              let precision = 2;
+              if (price < 1) precision = 6;
+              else if (price < 10) precision = 4;
+              else if (price < 500) precision = 3;
+
+              const mockTrade = {
+                e: "aggTrade",
+                E: Date.now() - Math.floor(Math.random() * 300),
+                s: symbolUpper,
+                p: microPrice.toFixed(precision),
+                q: size.toFixed(3),
+                m: isMakerBuyer,
+                T: Date.now()
+              };
+              feed.tradeBuffer.push(mockTrade);
+            }
+            break; // successfully polled, exit url loop for this symbol
           }
-          // Notify client we're using fallback polling
-          broadcast({ type: "ws_status", status: `OK [FALLBACK POLLED - ${symbolUpper}]`, url: "REST API fallback" });
-
-          // Generate simulated active trade flow using the actual live spot/futures price
-          const randomTradesCount = Math.floor(Math.random() * 5) + 2; // 2 to 6 simulated micro-trades
-          for (let i = 0; i < randomTradesCount; i++) {
-            const spreadOffset = (Math.random() - 0.5) * (price * 0.00008); // dynamic micro-jitter
-            const microPrice = price + spreadOffset;
-            const size = Math.random() * 0.4 + 0.01;
-            const isMakerBuyer = Math.random() > 0.5;
-
-            // Determine formatting precision based on price scale
-            let precision = 2;
-            if (price < 1) precision = 6;
-            else if (price < 10) precision = 4;
-            else if (price < 500) precision = 3;
-
-            const mockTrade = {
-              e: "aggTrade",
-              E: Date.now() - Math.floor(Math.random() * 300),
-              s: symbolUpper,
-              p: microPrice.toFixed(precision),
-              q: size.toFixed(3),
-              m: isMakerBuyer,
-              T: Date.now()
-            };
-            broadcast(mockTrade);
-          }
-          break; // successfully polled, exit loop
         }
+      } catch (err: any) {
+        // Quiet fail to next mirror
       }
-    } catch (err: any) {
-      // Quiet fail to next mirror
     }
   }
 }
 
 // Tick the fallback REST poller every 1.5 seconds
 setInterval(pollFallbackPrice, 1500);
-
-// Broadcast to SSE clients
-function broadcast(data: string | object, isRawString = false) {
-  const payload = isRawString ? (data as string) : JSON.stringify(data);
-  clients.forEach((client) => {
-    try {
-      client.res.write(`data: ${payload}\n\n`);
-      if (typeof (client.res as any).flush === 'function') {
-        (client.res as any).flush();
-      }
-    } catch (e) {
-      // client stale or closed
-    }
-  });
-}
 
 // API Routes FIRST
 
@@ -206,8 +287,16 @@ app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     backend_time: new Date().toISOString(),
-    binance_ws_active: binanceWs && binanceWs.readyState === WebSocketClient.OPEN,
-    binance_ws_url: currentWsUrl,
+    active_feeds_count: activeFeeds.size,
+    active_feeds: Array.from(activeFeeds.keys()).map(k => {
+      const feed = activeFeeds.get(k)!;
+      return {
+        symbol: k,
+        ws_open: feed.ws && feed.ws.readyState === WebSocketClient.OPEN,
+        clients: feed.clientsCount,
+        last_msg_age_ms: feed.lastMessageTime ? Date.now() - feed.lastMessageTime : -1
+      };
+    }),
     active_sse_clients: clients.length
   });
 });
@@ -247,7 +336,7 @@ app.get("/api/klines", async (req, res) => {
     }
   }
 
-  // Final fallback to mock if completely blacklisted on all REST APIs (extremely rare in node container)
+  // Final fallback
   return res.status(502).json({ error: "Failed to load candle data from all Binance mirrors." });
 });
 
@@ -311,7 +400,6 @@ app.get("/api/tickers24h", async (req, res) => {
             const highPrice = parseFloat(t.highPrice) || 0;
             const lowPrice = parseFloat(t.lowPrice) || 0;
             
-            // "In-Play" (В игре) criteria: volatile momentum with significant price move AND trading liquidity
             const isInPlay = Math.abs(priceChangePercent) >= 4.0 && quoteVolume >= 10000000;
 
             return {
@@ -325,8 +413,6 @@ app.get("/api/tickers24h", async (req, res) => {
             };
           });
 
-        // Pre-sort overall lists (will be presented elegantly on front-end)
-        // Sort: In-Play first (by volume), then others (by volume)
         formatted.sort((a, b) => {
           if (a.isInPlay && !b.isInPlay) return -1;
           if (!a.isInPlay && b.isInPlay) return 1;
@@ -343,39 +429,128 @@ app.get("/api/tickers24h", async (req, res) => {
   return res.status(502).json({ error: "Failed to load ticker list from Binance mirrors." });
 });
 
+app.post("/api/blackbox/analyze", async (req, res) => {
+  try {
+    const { trades, signals, config, metrics } = req.body;
+    
+    // Check if GEMINI_API_KEY exists
+    if (!process.env.GEMINI_API_KEY) {
+      return res.json({
+        success: false,
+        error: "GEMINI_API_KEY is not defined in environments.",
+        fallbackReport: `### ⚠️ Внимание: Отсутствует Ключ API Gemini!
+Для выполнения полноценного стратегического анализа тяжелой моделью, пожалуйста, добавьте ваш **GEMINI_API_KEY** в панель **Settings > Secrets**.
+
+#### Предварительный автоматический аудит сессии (Симуляция):
+* **Количество сделок**: ${(trades || []).length} сделок в сессии.
+* **Направление дисбаланса ленты**: Большинство сигналов совпадает с микроструктурной плотностью.
+* **Kelly Fraction**: Текущее значение (${config?.risk?.kellyFraction || 0.05}) оптимально для сохранения живучести депозита при текущем математическом ожидании.
+* **Рекурсивная фиксация (Repeat TP)**: ${config?.execution?.recursivePartialTpEnabled ? "Включена. Позволяет наращивать прибыль при импульсных пробоях за счет многократного половинного закрытия остатка." : "Выключена. Рассмотрите активацию при торговле волатильными активами."}`
+      });
+    }
+
+    const ai = getGeminiClient();
+    
+    // Build a concise context representation to avoid exceeding token limit and save latency
+    const metricsSummary = (metrics || []).slice(-15).map((m: any) => ({
+      time: m.time,
+      price: m.price,
+      cvd: m.cvd,
+      zScore: m.zScore,
+      tradeSpeed: m.tradeSpeed
+    }));
+
+    const tradesSummary = (trades || []).slice(-12).map((t: any) => ({
+      type: t.type,
+      entry: t.price,
+      exit: t.exitPrice,
+      qty: t.qty,
+      pnl: t.pnl,
+      fees: t.fees,
+      duration: t.durationSeconds,
+      reason: t.exitReason
+    }));
+
+    const signalsSummary = (signals || []).slice(-12).map((s: any) => ({
+      type: s.type,
+      price: s.price,
+      msg: s.message
+    }));
+
+    const prompt = `Проанализируй торговую сессию форвардтестинга алгоритма:
+Настройки исполнения:
+${JSON.stringify(config?.execution || {}, null, 2)}
+
+Настройки риск-менеджмента:
+${JSON.stringify(config?.risk || {}, null, 2)}
+
+Положение и символы:
+Символ: ${config?.symbols || "BTCUSDT"}
+
+Последние 12 совершенных сделок:
+${JSON.stringify(tradesSummary, null, 2)}
+
+Последние 12 микро-сигналов и лента активности:
+${JSON.stringify(signalsSummary, null, 2)}
+
+Рыночные микроструктурные метрики (последние зафиксированные срезы):
+${JSON.stringify(metricsSummary, null, 2)}
+
+Составь глубокий стратегический экспертный отчет:
+1. Оценка точности входа (правильно ли алгоритм отслеживал плотности и микроструктурный пробой).
+2. Анализ эффективности выхода и удержания позиций. Оцени влияние частичной фиксации (TP 50%) и рекурсивных фиксаций (если они были включены).
+3. Анализ Kelly Fraction и просадок.
+4. Конкретные математические и параметрические рекомендации по оптимизации фильтров (CVD, Z-score, лимиты проскальзывания, периоды калибровки).
+
+Пиши на профессиональном языке квантовых исследователей (Q-language), структурированно, без воды. Используй Markdown.`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: prompt,
+      config: {
+        systemInstruction: "Ты - ведущий эксперт по количественным стратегиям (Quantitative Researcher) и микроструктурному анализу рынка. Анализируешь логи и метрики алгоритма и даешь детальные, хардкорные математические выводы."
+      }
+    });
+
+    res.json({
+      success: true,
+      report: response.text
+    });
+  } catch (error: any) {
+    console.error("Failed Black Box Analysis:", error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // SSE endpoint to broadcast binance order book trades live with zero firewall restrictions
 app.get("/api/stream", (req, res) => {
   const reqSymbol = (req.query.symbol as string || "BTCUSDT").trim().toLowerCase();
 
-  if (reqSymbol && reqSymbol !== activeSymbol) {
-    addLog("INFO", `Stream requested symbol change from ${activeSymbol} to ${reqSymbol}`);
-    activeSymbol = reqSymbol;
-    if (disconnectBinanceFeed) {
-      disconnectBinanceFeed();
-    }
-    disconnectBinanceFeed = connectBinance(reqSymbol);
-  }
-
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no"); // Prevents Nginx/Cloud Run proxy from buffering the stream
+  res.setHeader("X-Accel-Buffering", "no");
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.flushHeaders();
 
-  // Send status
-  const currentStatus = binanceWs && binanceWs.readyState === WebSocketClient.OPEN ? "OK" : "RECONNECTING";
-  res.write(`data: ${JSON.stringify({ type: "ws_status", status: currentStatus, url: currentWsUrl })}\n\n`);
+  // Start multiplexed feed for this symbol
+  startFeed(reqSymbol);
+
+  // Send initial status
+  const feed = activeFeeds.get(reqSymbol);
+  const currentStatus = feed && feed.ws && feed.ws.readyState === WebSocketClient.OPEN ? `OK [${reqSymbol.toUpperCase()}]` : "RECONNECTING";
+  res.write(`data: ${JSON.stringify({ type: "ws_status", status: currentStatus, url: feed?.wsUrl || "" })}\n\n`);
   if (typeof (res as any).flush === 'function') {
     (res as any).flush();
   }
 
-  const client: SseClient = { res };
+  const client: SseClient = { res, symbol: reqSymbol };
   clients.push(client);
 
   req.on("close", () => {
     clients = clients.filter((c) => c !== client);
-    console.log(`[Server] SSE Client disconnected. Currently active clients: ${clients.length}`);
+    stopFeed(reqSymbol);
+    console.log(`[Server] Client disconnected from ${reqSymbol}. Active overall clients: ${clients.length}`);
   });
 });
 
@@ -394,8 +569,8 @@ setInterval(() => {
 }, 10000);
 
 async function startServer() {
-  // Fire up the background Binance WS client
-  disconnectBinanceFeed = connectBinance("btcusdt");
+  // Start default feed BTCUSDT on server boot
+  startFeed("btcusdt");
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -412,12 +587,15 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[Server] Full-stack engine listening on http://0.0.0.0:${PORT}`);
+    addLog("INFO", `Multiplexed full-stack engine listening on http://0.0.0.0:${PORT}`);
   });
 
   process.on("SIGTERM", () => {
-    if (disconnectBinanceFeed) {
-      disconnectBinanceFeed();
+    for (const [s, feed] of activeFeeds.entries()) {
+      feed.active = false;
+      if (feed.ws) {
+        try { feed.ws.terminate(); } catch (e) {}
+      }
     }
     process.exit(0);
   });

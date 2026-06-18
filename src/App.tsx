@@ -6,8 +6,9 @@ import { SignalLog } from './components/SignalLog';
 import { MarketChart } from './components/MarketChart';
 import { PortfolioComponent } from './components/PortfolioComponent';
 import { useEngine } from './hooks/useEngine';
-import { Activity, LayoutDashboard, BarChart2, Briefcase, Terminal, X, Play, Pause, Flame } from 'lucide-react';
+import { Activity, LayoutDashboard, BarChart2, Briefcase, Terminal, X, Play, Pause, Flame, Eye } from 'lucide-react';
 import { SymbolSelectorModal } from './components/SymbolSelectorModal';
+import { BlackBoxPanel } from './components/BlackBoxPanel';
 
 export default function App() {
   const {
@@ -38,7 +39,7 @@ export default function App() {
     warmupSecondsLeft
   } = useEngine();
 
-  const [view, setView] = useState<'dashboard' | 'chart' | 'portfolio'>('dashboard');
+  const [view, setView] = useState<'dashboard' | 'chart' | 'portfolio' | 'blackbox'>('dashboard');
   const [chartFullscreen, setChartFullscreen] = useState(false);
   const [logs, setLogs] = useState<{ time: string; level: string; message: string }[]>([]);
   const [showLogs, setShowLogs] = useState(false);
@@ -92,6 +93,9 @@ export default function App() {
               </button>
               <button onClick={() => { setView('portfolio'); setChartFullscreen(false); }} className={`px-3 py-1 rounded text-[10px] font-bold tracking-wider transition-colors hover:text-[#f59e0b] ${view === 'portfolio' ? 'bg-[#0a0f1d] text-[#e0e0e0] border border-[#1a2233]' : 'text-[#64748b] border border-transparent'}`}>
                 <Briefcase className="w-3 h-3 inline mr-1 -mt-0.5"/> СДЕЛКИ И PNL
+              </button>
+              <button onClick={() => { setView('blackbox'); setChartFullscreen(false); }} className={`px-3 py-1 rounded text-[10px] font-bold tracking-wider transition-colors hover:text-[#a855f7] ${view === 'blackbox' ? 'bg-[#0a0f1d] text-[#e0e0e0] border border-purple-500/20' : 'text-[#64748b] border border-transparent'}`}>
+                <Eye className="w-3 h-3 inline mr-1 -mt-0.5 text-purple-400"/> ЧЕРНЫЙ ЯЩИК (AI)
               </button>
             </div>
 
@@ -220,6 +224,16 @@ export default function App() {
                  <Charts data={metrics} />
                </div>
              </>
+           )}
+
+           {view === 'blackbox' && (
+             <BlackBoxPanel
+               trades={trades}
+               signals={signals}
+               config={config}
+               metrics={metrics}
+               halted={halted}
+             />
            )}
 
            {view === 'chart' && (

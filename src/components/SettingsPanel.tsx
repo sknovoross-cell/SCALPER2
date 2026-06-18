@@ -125,6 +125,19 @@ export function SettingsPanel({ config, onChange, onOpenSelector }: SettingsPane
                      })} 
                    />
                  </label>
+                  {config.execution.partialTakeProfitEnabled && (
+                    <label className="flex items-center justify-between cursor-pointer select-none pl-3 border-l border-[#38bdf8]/30">
+                      <span className="text-[#a0aec0] text-xs">↳ Repeat 50% Fix (Повторная фиксация)</span>
+                      <input 
+                        type="checkbox" 
+                        className="w-3.5 h-3.5 accent-[#38bdf8] cursor-pointer" 
+                        checked={config.execution.recursivePartialTpEnabled} 
+                        onChange={e => onChange({
+                          execution: { ...config.execution, recursivePartialTpEnabled: e.target.checked }
+                        })} 
+                      />
+                    </label>
+                  )}
                  <label className="flex items-center justify-between cursor-pointer select-none">
                    <span className="text-[#a0aec0]">Signal Exit (Встречный сигнал)</span>
                    <input 
@@ -192,6 +205,17 @@ export function SettingsPanel({ config, onChange, onOpenSelector }: SettingsPane
                    />
                  </label>
                  <label className="flex items-center justify-between cursor-pointer select-none border-t border-[#1a2232]/50 pt-2 mt-1">
+                   <span className="text-[#38bdf8] font-semibold">Solution B: Direct Crossover (Пробой зон)</span>
+                   <input 
+                     type="checkbox" 
+                     className="w-3.5 h-3.5 accent-[#38bdf8] cursor-pointer" 
+                     checked={config.execution.solutionBEnabled || false} 
+                     onChange={e => onChange({
+                       execution: { ...config.execution, solutionBEnabled: e.target.checked }
+                     })} 
+                   />
+                 </label>
+                 <label className="flex items-center justify-between cursor-pointer select-none border-t border-[#1a2232]/50 pt-2 mt-1">
                    <span className="text-amber-500 font-semibold">ЛП: Вход на возврате (Retrace Filter)</span>
                    <input 
                      type="checkbox" 
@@ -202,11 +226,111 @@ export function SettingsPanel({ config, onChange, onOpenSelector }: SettingsPane
                      })} 
                    />
                  </label>
+                 <label className="flex items-center justify-between cursor-pointer select-none border-t border-[#1a2232]/50 pt-2 mt-1">
+                   <span className="text-amber-400 font-bold">Набор частями (Метод 1)</span>
+                   <input 
+                     type="checkbox" 
+                     className="w-3.5 h-3.5 accent-amber-400 cursor-pointer" 
+                     checked={config.execution.scaleInGridEnabled || false} 
+                     onChange={e => onChange({
+                       execution: { ...config.execution, scaleInGridEnabled: e.target.checked }
+                     })} 
+                   />
+                 </label>
+                 <label className="flex items-center justify-between cursor-pointer select-none border-t border-[#1a2232]/50 pt-2 mt-1">
+                   <span className="text-purple-400 font-bold">Черный Ящик (ИИ Наблюдатель)</span>
+                   <input 
+                     type="checkbox" 
+                     className="w-3.5 h-3.5 accent-purple-400 cursor-pointer" 
+                     checked={config.execution.blackBoxEnabled !== false} 
+                     onChange={e => onChange({
+                       execution: { ...config.execution, blackBoxEnabled: e.target.checked }
+                     })} 
+                   />
+                 </label>
+
+                  <div className="border-t border-[#1a2232]/50 pt-2.5 mt-1 space-y-2.5">
+                    <span className="text-[#a0aec0] font-bold block uppercase tracking-wider text-[9px]">Расчет TP/SL (Гибрид 5)</span>
+                    <div className="flex gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => onChange({ execution: { ...config.execution, tpSlCalculationType: 'percent' } })}
+                        className={`flex-1 py-1 text-[9px] font-bold uppercase rounded-sm border transition-all cursor-pointer ${
+                          (config.execution.tpSlCalculationType ?? 'percent') === 'percent'
+                            ? 'bg-[#38bdf8]/10 text-[#38bdf8] border-[#38bdf8]/30 shadow-[0_0_8px_rgba(56,189,248,0.1)]'
+                            : 'bg-transparent text-[#64748b] border-[#1a2233] hover:text-[#adbcd0]'
+                        }`}
+                      >
+                        Фикс (%)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onChange({ execution: { ...config.execution, tpSlCalculationType: 'atr' } })}
+                        className={`flex-1 py-1 text-[9px] font-bold uppercase rounded-sm border transition-all cursor-pointer ${
+                          config.execution.tpSlCalculationType === 'atr'
+                            ? 'bg-[#14b8a6]/10 text-[#14b8a6] border-[#14b8a6]/30 shadow-[0_0_8px_rgba(20,184,166,0.1)]'
+                            : 'bg-transparent text-[#64748b] border-[#1a2233] hover:text-[#adbcd0]'
+                        }`}
+                      >
+                        ATR (Динам)
+                      </button>
+                    </div>
+
+                    {config.execution.tpSlCalculationType === "atr" && (
+                      <div className="pl-2 border-l border-[#14b8a6]/30 space-y-2 mt-1 pt-0.5">
+                        <label className="flex flex-col gap-1">
+                          <span className="text-[#64748b] text-[9px]">Период ATR (10 - 50)</span>
+                          <input
+                            type="number"
+                            min="10"
+                            max="50"
+                            step="1"
+                            value={config.execution.atrPeriod ?? 14}
+                            onChange={(e) => {
+                              const val = Math.max(10, Math.min(50, parseInt(e.target.value) || 14));
+                              onChange({ execution: { ...config.execution, atrPeriod: val } });
+                            }}
+                            className="bg-[#050608] border border-[#1a2233] rounded px-2 py-0.5 text-[#e0e0e0] outline-none focus:border-[#14b8a6] transition-colors text-[10px]"
+                          />
+                        </label>
+                        <label className="flex flex-col gap-1">
+                          <span className="text-[#64748b] text-[9px]">Множитель SL (стандарт: 1.5)</span>
+                          <input
+                            type="number"
+                            min="0.1"
+                            max="10.0"
+                            step="0.1"
+                            value={config.execution.atrSlMultiplier ?? 1.5}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value) || 1.5;
+                              onChange({ execution: { ...config.execution, atrSlMultiplier: val } });
+                            }}
+                            className="bg-[#050608] border border-[#1a2233] rounded px-2 py-0.5 text-[#e0e0e0] outline-none focus:border-[#14b8a6] transition-colors text-[10px]"
+                          />
+                        </label>
+                        <label className="flex flex-col gap-1">
+                          <span className="text-[#64748b] text-[9px]">Множитель TP (стандарт: 3.0)</span>
+                          <input
+                            type="number"
+                            min="0.1"
+                            max="20.0"
+                            step="0.1"
+                            value={config.execution.atrTpMultiplier ?? 3.0}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value) || 3.0;
+                              onChange({ execution: { ...config.execution, atrTpMultiplier: val } });
+                            }}
+                            className="bg-[#050608] border border-[#1a2233] rounded px-2 py-0.5 text-[#e0e0e0] outline-none focus:border-[#14b8a6] transition-colors text-[10px]"
+                          />
+                        </label>
+                      </div>
+                    )}
+                  </div>
               </div>
             </div>
          </div>
        </div>
 
-     </div>
-   );
- }
+    </div>
+  );
+}

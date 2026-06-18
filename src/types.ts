@@ -43,6 +43,7 @@ export interface TradePosition {
   slPrice?: number;
   maxFavPrice?: number;
   hasPartialTP?: boolean;
+  lastPartialPrice?: number;
   positionCvd?: number;
   adverseTicksCount?: number;
   adverseEnergy?: number;
@@ -55,6 +56,9 @@ export interface TradePosition {
   zonePocHit?: boolean;
   zoneKey?: string;
   positionTicksCount?: number;
+  winProbability?: number;
+  orderbookPressureInfo?: string;
+  gridLevels?: { price: number; size: number; filled: boolean; id: string }[];
 }
 
 export interface HistorisedTrade {
@@ -98,6 +102,7 @@ export interface AppConfig {
     breakevenEnabled: boolean;
     trailingStopEnabled: boolean;
     partialTakeProfitEnabled: boolean;
+    recursivePartialTpEnabled: boolean;
     signalExitEnabled: boolean;
     feeExitEnabled: boolean;
     predictiveLiqEnabled: boolean;
@@ -108,6 +113,13 @@ export interface AppConfig {
     reduceSizeOnLtf: boolean;
     falseBreakoutDelayEnabled: boolean;
     zoneTouchPocDeciderEnabled: boolean;
+    solutionBEnabled: boolean;
+    scaleInGridEnabled?: boolean;
+    blackBoxEnabled?: boolean;
+    tpSlCalculationType?: 'percent' | 'atr';
+    atrPeriod?: number;
+    atrSlMultiplier?: number;
+    atrTpMultiplier?: number;
   };
 }
 

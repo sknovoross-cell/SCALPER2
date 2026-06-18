@@ -64,6 +64,13 @@ export function PortfolioComponent({
     }
   }
 
+  // Calculate grid fill percentages if grid levels exist
+  const unfulfilledSize = position?.gridLevels && position.gridLevels.length > 0
+    ? position.gridLevels.filter(g => !g.filled).reduce((acc, lvl) => acc + lvl.size, 0)
+    : 0;
+  const plannedTotalSize = position ? (position.size + unfulfilledSize) : 0;
+  const accumulatedSizePct = plannedTotalSize > 0 ? (position.size / plannedTotalSize) * 100 : 100;
+
   // Calculate dynamic Trade Health Index & Case Evaluation
   let tradeHealthIndex = 100;
   let caseEvaluationResult = "STABLE";
@@ -262,6 +269,28 @@ export function PortfolioComponent({
                   </div>
                </div>
 
+               {/* Набор намеченного объема */}
+               <div className="pt-3 pb-3 border-b border-[#1a2233]">
+                 <div className="flex justify-between items-center text-[10px] text-[#64748b] uppercase tracking-wider mb-1">
+                   <span>Набрано от намеченного (Volume Accumulated)</span>
+                   <span className="font-bold text-[#38bdf8] font-mono">
+                     {Math.round(accumulatedSizePct)}% ({fmtQty(currentPrice, position.size)} / {fmtQty(currentPrice, plannedTotalSize)} {baseAsset})
+                   </span>
+                 </div>
+                 <div className="w-full bg-[#111827] h-1.5 rounded-full overflow-hidden border border-[#1a2233] relative">
+                   <div 
+                     className="h-full bg-gradient-to-r from-[#38bdf8] to-[#14b8a6] transition-all duration-500"
+                     style={{ width: `${accumulatedSizePct}%` }}
+                   />
+                 </div>
+                 {position.gridLevels && position.gridLevels.length > 0 && (
+                    <div className="flex justify-between mt-1 text-[8px] text-[#52647c] font-mono">
+                      <span>Первый лот: {Math.round(100 / (position.gridLevels.length + 1))}%</span>
+                      <span>Сетка лимитов: {position.gridLevels.filter(g => g.filled).length} из {position.gridLevels.length} набрано</span>
+                    </div>
+                 )}
+               </div>
+
                <div className="grid grid-cols-2 gap-4 pt-3 pb-3">
                   <div>
                      <p className="text-[10px] text-[#64748b] uppercase">Цена Входа (Avg Entry)</p>
@@ -389,29 +418,112 @@ export function PortfolioComponent({
                     });
 
                     return (
-                      <div className="mt-2.5 pt-2 border-t border-dashed border-[#1a2233]/40 text-[9px]">
-                        <div className="flex justify-between items-center text-[#64748b] uppercase font-bold mb-1 tracking-wider">
+                      <div className="mt-2.5 pt-2 border-t border-[#1a2233]/40 text-[9px]">
+                        <div className="flex justify-between items-center text-[#64748b] uppercase font-bold mb-2 tracking-wider">
                           <span>Контроль уровней (Decider Standby)</span>
-                          <span className="flex items-center gap-1 text-[8px] text-[#38bdf8] bg-[#38bdf8]/10 px-1 py-0.5 rounded border border-[#38bdf8]/20">
-                            <span className="inline-block w-1.5 h-1.5 rounded-full bg-[#38bdf8] animate-pulse"></span>
-                            ACTIVE SCAN
-                          </span>
+                          {(() => {
+                            const distPct = (minDistance / currentPrice) * 100;
+                            let badgeText = "STANDBY";
+                            let badgeColor = "bg-gray-500/10 text-gray-400 border-gray-500/20";
+                            let dotColor = "bg-gray-400";
+                            if (minDistance === 0) {
+                              badgeText = "PENETRATED";
+                              badgeColor = "bg-red-500/10 text-rose-400 border-red-500/20";
+                              dotColor = "bg-rose-500";
+                            } else if (distPct <= 0.1) {
+                              badgeText = "ARMED";
+                              badgeColor = "bg-amber-500/10 text-amber-400 border-amber-500/20";
+                              dotColor = "bg-amber-500";
+                            } else if (distPct <= 0.3) {
+                              badgeText = "APPROACHING";
+                              badgeColor = "bg-cyan-500/10 text-cyan-400 border-cyan-500/20";
+                              dotColor = "bg-cyan-500";
+                            }
+                            return (
+                              <span className={`flex items-center gap-1 text-[8px] px-1.5 py-0.5 rounded border ${badgeColor}`}>
+                                <span className={`inline-block w-1.5 h-1.5 rounded-full ${dotColor} animate-pulse`}></span>
+                                {badgeText}
+                              </span>
+                            );
+                          })()}
                         </div>
                         {nearestZone ? (
-                          <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[#52647c] font-mono mt-1">
-                            <div className="flex justify-between">
-                              <span>Ближайший уровень:</span>
-                              <span className="text-gray-400 font-semibold">{nearestZone.type}</span>
-                            </div>
-                            <div className="flex justify-between">
-                              <span>Цель уровня (POC):</span>
-                              <span className="text-gray-400 font-bold">${nearestZone.price.toFixed(1)}</span>
-                            </div>
-                            <div className="flex justify-between col-span-2 border-t border-[#1a2233]/25 pt-1 mt-0.5">
-                              <span>Удаленность до границы:</span>
-                              <span className="text-[#38bdf8] font-bold">
-                                {minDistance === 0 ? "Касание зоны" : `${minDistance.toFixed(1)} USDT`}
-                              </span>
+                          <div className="space-y-2">
+                            {/* Proximity visual gauge */}
+                            {(() => {
+                              const distPct = (minDistance / currentPrice) * 100;
+                              const proximity = Math.max(0, Math.min(100, (1 - (distPct / 0.5)) * 100));
+                              const barColor = distPct === 0 
+                                ? "bg-gradient-to-r from-rose-500 to-red-500" 
+                                : distPct <= 0.1 
+                                  ? "bg-gradient-to-r from-amber-500 to-orange-500" 
+                                  : "bg-gradient-to-r from-cyan-500 to-emerald-500";
+                              return (
+                                <div className="space-y-1">
+                                  <div className="flex justify-between text-[8px] text-[#52647c] font-mono">
+                                    <span>ИНДЕКС СБЛИЖЕНИЯ (PROXIMITY)</span>
+                                    <span>{proximity.toFixed(0)}%</span>
+                                  </div>
+                                  <div className="w-full bg-[#07090e] h-1 rounded overflow-hidden relative border border-[#1a2233]/40">
+                                    <div 
+                                      className={`h-full ${barColor} transition-all duration-300`}
+                                      style={{ width: `${proximity}%` }}
+                                    />
+                                  </div>
+                                </div>
+                              );
+                            })()}
+
+                            {/* Info grid */}
+                            <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-[#52647c] font-mono bg-[#080b13]/55 p-2 rounded border border-[#1a2233]/40">
+                              <div className="flex justify-between border-b border-[#1a2233]/20 pb-0.5">
+                                <span>Ближайший уровень:</span>
+                                <span className="text-gray-300 font-semibold">{nearestZone.type}</span>
+                              </div>
+                              <div className="flex justify-between border-b border-[#1a2233]/20 pb-0.5">
+                                <span>Диапазон ликв-ти:</span>
+                                <span className="text-gray-300">
+                                  {nearestZone.priceLow !== undefined && nearestZone.priceHigh !== undefined
+                                    ? `$${nearestZone.priceLow.toFixed(1)} - $${nearestZone.priceHigh.toFixed(1)}`
+                                    : `$${nearestZone.price.toFixed(1)}`
+                                  }
+                                </span>
+                              </div>
+                              <div className="flex justify-between border-b border-[#1a2233]/20 pb-0.5">
+                                <span>Цель уровня (POC):</span>
+                                <span className="text-[#38bdf8] font-bold">${nearestZone.price.toFixed(1)}</span>
+                              </div>
+                              <div className="flex justify-between border-b border-[#1a2233]/20 pb-0.5">
+                                <span>Атрибуты / Tests:</span>
+                                <span className="text-gray-300">
+                                  <span className={`px-1 py-0.5 rounded text-[7px] leading-none ${nearestZone.levelStrength === 'HTF' ? 'bg-amber-500/10 text-amber-500 border border-amber-500/20' : 'bg-blue-500/10 text-blue-400 border border-blue-500/20'}`}>
+                                    {nearestZone.levelStrength || "LTF"}
+                                  </span>
+                                  <span className="text-gray-400 font-semibold ml-1.5">{nearestZone.touchesCount || 0} касаний</span>
+                                </span>
+                              </div>
+                              <div className="flex justify-between col-span-2 pt-0.5 pb-0.5 border-b border-[#1a2233]/20">
+                                <span>Удаленность до границы:</span>
+                                <span className="text-[#38bdf8] font-bold">
+                                  {minDistance === 0 
+                                    ? "Касание зоны" 
+                                    : `${minDistance.toFixed(1)} USDT (${((minDistance / currentPrice) * 100).toFixed(3)}%)`
+                                  }
+                                </span>
+                              </div>
+                              {nearestZone.volumeScore !== undefined && (
+                                <div className="flex justify-between col-span-2 text-[8px]">
+                                  <span>Профиль (Vol Score / CVD):</span>
+                                  <span className="text-gray-400 font-bold">
+                                    Vol: <span className="text-[#3dcd89]">{nearestZone.volumeScore.toFixed(1)}</span>
+                                    {nearestZone.cvdScore !== undefined && (
+                                      <> | CVD: <span className={nearestZone.cvdScore >= 0 ? "text-[#38bdf8]" : "text-rose-400"}>
+                                        {nearestZone.cvdScore >= 0 ? '+' : ''}{nearestZone.cvdScore.toFixed(1)}
+                                      </span></>
+                                    )}
+                                  </span>
+                                </div>
+                              )}
                             </div>
                           </div>
                         ) : (
@@ -474,28 +586,111 @@ export function PortfolioComponent({
 
                     return (
                       <div className="bg-[#0e1322]/40 p-3 rounded border border-[#1a2233] text-[9px] w-full">
-                        <div className="flex justify-between items-center text-[#64748b] uppercase font-bold mb-1.5 tracking-wider">
+                        <div className="flex justify-between items-center text-[#64748b] uppercase font-bold mb-2 tracking-wider">
                           <span>Контроль уровней (Decider Standby)</span>
-                          <span className="flex items-center gap-1 text-[8px] text-[#38bdf8] bg-[#38bdf8]/10 px-1 py-0.5 rounded border border-[#38bdf8]/20 animate-pulse">
-                            <span className="inline-block w-1.5 h-1.5 rounded-full bg-[#38bdf8]"></span>
-                            ACTIVE SCAN
-                          </span>
+                          {(() => {
+                            const distPct = (minDistance / currentPrice) * 100;
+                            let badgeText = "STANDBY";
+                            let badgeColor = "bg-gray-500/10 text-gray-400 border-gray-500/20";
+                            let dotColor = "bg-gray-400";
+                            if (minDistance === 0) {
+                              badgeText = "PENETRATED";
+                              badgeColor = "bg-red-500/10 text-rose-400 border-red-500/20";
+                              dotColor = "bg-rose-500";
+                            } else if (distPct <= 0.1) {
+                              badgeText = "ARMED";
+                              badgeColor = "bg-amber-500/10 text-amber-400 border-amber-500/20";
+                              dotColor = "bg-amber-500";
+                            } else if (distPct <= 0.3) {
+                              badgeText = "APPROACHING";
+                              badgeColor = "bg-cyan-500/10 text-cyan-400 border-cyan-500/20";
+                              dotColor = "bg-cyan-500";
+                            }
+                            return (
+                              <span className={`flex items-center gap-1 text-[8px] px-1.5 py-0.5 rounded border ${badgeColor}`}>
+                                <span className={`inline-block w-1.5 h-1.5 rounded-full ${dotColor} animate-pulse`}></span>
+                                {badgeText}
+                              </span>
+                            );
+                          })()}
                         </div>
                         {nearestZone ? (
-                          <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[#52647c] font-mono mt-1">
-                            <div className="flex justify-between">
-                              <span>Ближайший уровень:</span>
-                              <span className="text-gray-400 font-semibold">{(nearestZone as LiquidityZone).type}</span>
-                            </div>
-                            <div className="flex justify-between">
-                              <span>Цель уровня (POC):</span>
-                              <span className="text-gray-400 font-bold">${(nearestZone as LiquidityZone).price.toFixed(1)}</span>
-                            </div>
-                            <div className="flex justify-between col-span-2 border-t border-[#1a2233]/25 pt-1.5 mt-1">
-                              <span>Удаленность до границы:</span>
-                              <span className="text-[#38bdf8] font-bold">
-                                {minDistance === 0 ? "Касание зоны" : `${minDistance.toFixed(1)} USDT`}
-                              </span>
+                          <div className="space-y-2 mt-1">
+                            {/* Proximity visual gauge */}
+                            {(() => {
+                              const distPct = (minDistance / currentPrice) * 100;
+                              const proximity = Math.max(0, Math.min(100, (1 - (distPct / 0.5)) * 100));
+                              const barColor = distPct === 0 
+                                ? "bg-gradient-to-r from-rose-500 to-red-500" 
+                                : distPct <= 0.1 
+                                  ? "bg-gradient-to-r from-amber-500 to-orange-500" 
+                                  : "bg-gradient-to-r from-cyan-500 to-emerald-500";
+                              return (
+                                <div className="space-y-1">
+                                  <div className="flex justify-between text-[8px] text-[#52647c] font-mono">
+                                    <span>ИНДЕКС СБЛИЖЕНИЯ (PROXIMITY)</span>
+                                    <span>{proximity.toFixed(0)}%</span>
+                                  </div>
+                                  <div className="w-full bg-[#07090e] h-1 rounded overflow-hidden relative border border-[#1a2233]/40">
+                                    <div 
+                                      className={`h-full ${barColor} transition-all duration-300`}
+                                      style={{ width: `${proximity}%` }}
+                                    />
+                                  </div>
+                                </div>
+                              );
+                            })()}
+
+                            {/* Info grid */}
+                            <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-[#52647c] font-mono bg-[#080b13]/55 p-2 rounded border border-[#1a2233]/40">
+                              <div className="flex justify-between border-b border-[#1a2233]/20 pb-0.5">
+                                <span>Ближайший уровень:</span>
+                                <span className="text-gray-300 font-semibold">{nearestZone.type}</span>
+                              </div>
+                              <div className="flex justify-between border-b border-[#1a2233]/20 pb-0.5">
+                                <span>Диапазон ликв-ти:</span>
+                                <span className="text-gray-300">
+                                  {nearestZone.priceLow !== undefined && nearestZone.priceHigh !== undefined
+                                    ? `$${nearestZone.priceLow.toFixed(1)} - $${nearestZone.priceHigh.toFixed(1)}`
+                                    : `$${nearestZone.price.toFixed(1)}`
+                                  }
+                                </span>
+                              </div>
+                              <div className="flex justify-between border-b border-[#1a2233]/20 pb-0.5">
+                                <span>Цель уровня (POC):</span>
+                                <span className="text-[#38bdf8] font-bold">${nearestZone.price.toFixed(1)}</span>
+                              </div>
+                              <div className="flex justify-between border-b border-[#1a2233]/20 pb-0.5">
+                                <span>Атрибуты / Tests:</span>
+                                <span className="text-gray-300">
+                                  <span className={`px-1 py-0.5 rounded text-[7px] leading-none ${nearestZone.levelStrength === 'HTF' ? 'bg-amber-500/10 text-amber-500 border border-amber-500/20' : 'bg-blue-500/10 text-blue-400 border border-blue-500/20'}`}>
+                                    {nearestZone.levelStrength || "LTF"}
+                                  </span>
+                                  <span className="text-gray-400 font-semibold ml-1.5">{nearestZone.touchesCount || 0} касаний</span>
+                                </span>
+                              </div>
+                              <div className="flex justify-between col-span-2 pt-0.5 pb-0.5 border-b border-[#1a2233]/20">
+                                <span>Удаленность до границы:</span>
+                                <span className="text-[#38bdf8] font-bold">
+                                  {minDistance === 0 
+                                    ? "Касание зоны" 
+                                    : `${minDistance.toFixed(1)} USDT (${((minDistance / currentPrice) * 100).toFixed(3)}%)`
+                                  }
+                                </span>
+                              </div>
+                              {nearestZone.volumeScore !== undefined && (
+                                <div className="flex justify-between col-span-2 text-[8px]">
+                                  <span>Профиль (Vol Score / CVD):</span>
+                                  <span className="text-gray-400 font-bold">
+                                    Vol: <span className="text-[#3dcd89]">{nearestZone.volumeScore.toFixed(1)}</span>
+                                    {nearestZone.cvdScore !== undefined && (
+                                      <> | CVD: <span className={nearestZone.cvdScore >= 0 ? "text-[#38bdf8]" : "text-rose-400"}>
+                                        {nearestZone.cvdScore >= 0 ? '+' : ''}{nearestZone.cvdScore.toFixed(1)}
+                                      </span></>
+                                    )}
+                                  </span>
+                                </div>
+                              )}
                             </div>
                           </div>
                         ) : (

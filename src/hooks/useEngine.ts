@@ -40,6 +40,7 @@ const INITIAL_CONFIG: AppConfig = {
     breakevenEnabled: true,
     trailingStopEnabled: true,
     partialTakeProfitEnabled: true,
+    recursivePartialTpEnabled: false,
     signalExitEnabled: false,
     feeExitEnabled: false,
     predictiveLiqEnabled: true,
@@ -50,6 +51,13 @@ const INITIAL_CONFIG: AppConfig = {
     reduceSizeOnLtf: true,
     falseBreakoutDelayEnabled: false,
     zoneTouchPocDeciderEnabled: true,
+    solutionBEnabled: true,
+    scaleInGridEnabled: true,
+    blackBoxEnabled: true,
+    tpSlCalculationType: "percent",
+    atrPeriod: 14,
+    atrSlMultiplier: 1.5,
+    atrTpMultiplier: 3.0,
   },
 };
 
@@ -95,7 +103,32 @@ export function calculateTargetPrices(
   strategyType: "BREAKOUT" | "ABSORPTION_FADE" | "FALSE_BREAKOUT",
   timeframe: string,
   feeExitEnabled?: boolean,
+  tpSlCalculationType?: 'percent' | 'atr',
+  atrVal?: number,
+  atrSlMultiplier?: number,
+  atrTpMultiplier?: number,
 ): { tpPrice: number; slPrice: number } {
+  if (tpSlCalculationType === "atr" && !feeExitEnabled) {
+    const finalAtr = atrVal && atrVal > 0 ? atrVal : entryPrice * 0.001; // fallback to 0.1% if not passed
+    const slMultiplier = atrSlMultiplier ?? 1.5;
+    const tpMultiplier = atrTpMultiplier ?? 3.0;
+
+    const slDiff = finalAtr * slMultiplier;
+    const tpDiff = finalAtr * tpMultiplier;
+
+    if (side === "BUY") {
+      return {
+        tpPrice: entryPrice + tpDiff,
+        slPrice: entryPrice - slDiff,
+      };
+    } else {
+      return {
+        tpPrice: entryPrice - tpDiff,
+        slPrice: entryPrice + slDiff,
+      };
+    }
+  }
+
   if (feeExitEnabled) {
     const entryFeeRate = strategyType === "BREAKOUT" ? 0.0004 : 0.0002;
     const tpPct = entryFeeRate + 0.0002 + 0.001; // Round-trip fee (TP maker) + 0.1%
@@ -255,6 +288,9 @@ export function useEngine() {
   const oiRef = useRef<number>(1342.5); // Live-mode Open Interest modeling value ($ million)
   const prevOiRef = useRef<number>(1342.5);
   const lastOiMsgTimeRef = useRef<number>(0);
+  const depthRef = useRef<{ bids: [number, number][]; asks: [number, number][] }>({ bids: [], asks: [] });
+  const lastDepthProcessedTimeRef = useRef<number>(0);
+  const lastZonesSetTimeRef = useRef<number>(0);
   const [warmupSecondsLeft, setWarmupSecondsLeft] = useState<number>(60);
   const warmupSecondsLeftRef = useRef<number>(60);
   warmupSecondsLeftRef.current = warmupSecondsLeft;
@@ -262,6 +298,7 @@ export function useEngine() {
   const levelPokeTrackerRef = useRef<Record<string, { pierced: boolean; maxPriceSeen?: number; minPriceSeen?: number; timestamp: number }>>({});
   const cooldownTicksRef = useRef<number>(0);
   const atrRef = useRef<number>(60); // 5m ATR for adaptive volatility-based interaction zones
+  const customAtrRef = useRef<number>(60); // Custom ATR based on user specified period
   const lastIgnoreLogTimeRef = useRef<Record<string, number>>({});
   const armedAccumulatorRef = useRef<{
     ticksCount: number;
@@ -494,6 +531,13 @@ export function useEngine() {
       if (typeof atr5m === "number" && !isNaN(atr5m) && atr5m > 0) {
         atrRef.current = atr5m;
       }
+      
+      const customPeriod = configRef.current?.execution?.atrPeriod ?? 14;
+      const customAcl = calculateATR(parsed5m, customPeriod);
+      if (typeof customAcl === "number" && !isNaN(customAcl) && customAcl > 0) {
+        customAtrRef.current = customAcl;
+      }
+
       const atr15m = calculateATR(parsed15m, 14);
       const atr1h = calculateATR(parsed1h, 14);
       const atr4h = calculateATR(parsed4h, 14);
@@ -1031,6 +1075,7 @@ export function useEngine() {
       klinesCacheRef.current = {};
       tapeSpeedHistoryRef.current = [];
       tickVolumeHistoryRef.current = [];
+      depthRef.current = { bids: [], asks: [] };
       
       console.log(`Loading fresh indicators and levels for ${symbol}...`);
       loadData();
@@ -1111,41 +1156,61 @@ export function useEngine() {
 
           try {
             const rawMsg = JSON.parse(e.data);
-            const msg = rawMsg.data ? rawMsg.data : rawMsg;
+            const messages = Array.isArray(rawMsg) ? rawMsg : [rawMsg];
 
-            if (msg.type === "ws_status") {
-              if (msg.status && msg.status.startsWith("OK")) {
-                setWsStatus(msg.status === "OK" ? `OK [${symbol}]` : msg.status);
-              } else {
-                setWsStatus(`RECONNECTING...`);
-                setLatency(0);
-              }
-            } else if (msg.e === "aggTrade") {
-              const price = parseFloat(msg.p);
-              const qty = parseFloat(msg.q);
+            for (const item of messages) {
+              const msg = item.data ? item.data : item;
 
-              aggRef.current.trades++;
-              if (msg.m) {
-                // m = true is maker buyer => taker seller -> sell volume
-                aggRef.current.sellVol += qty * price;
-              } else {
-                aggRef.current.buyVol += qty * price;
-              }
-              aggRef.current.lastPrice = price;
+              if (msg.type === "ws_status") {
+                if (msg.status && msg.status.startsWith("OK")) {
+                  setWsStatus(msg.status === "OK" ? `OK [${symbol}]` : msg.status);
+                } else {
+                  setWsStatus(`RECONNECTING...`);
+                  setLatency(0);
+                }
+              } else if (msg.e === "aggTrade") {
+                const price = parseFloat(msg.p);
+                const qty = parseFloat(msg.q);
 
-              // Measure real physical latency from Binance server event time E or trade time T
-              const realLatency = Math.max(
-                1,
-                Date.now() - (msg.E || msg.T || Date.now()),
-              );
-              latencyBuffer.current.push(realLatency);
-              if (latencyBuffer.current.length > 20)
-                latencyBuffer.current.shift();
-            } else if (msg.e === "openInterestUpdate") {
-              const latestRealOI = parseFloat(msg.o);
-              if (!isNaN(latestRealOI) && latestRealOI > 0) {
-                oiRef.current = latestRealOI;
-                lastOiMsgTimeRef.current = Date.now();
+                aggRef.current.trades++;
+                if (msg.m) {
+                  // m = true is maker buyer => taker seller -> sell volume
+                  aggRef.current.sellVol += qty * price;
+                } else {
+                  aggRef.current.buyVol += qty * price;
+                }
+                aggRef.current.lastPrice = price;
+
+                // Measure real physical latency from Binance server event time E or trade time T
+                const realLatency = Math.max(
+                  1,
+                  Date.now() - (msg.E || msg.T || Date.now()),
+                );
+                latencyBuffer.current.push(realLatency);
+                if (latencyBuffer.current.length > 20)
+                  latencyBuffer.current.shift();
+              } else if (msg.e === "openInterestUpdate") {
+                const latestRealOI = parseFloat(msg.o);
+                if (!isNaN(latestRealOI) && latestRealOI > 0) {
+                  oiRef.current = latestRealOI;
+                  lastOiMsgTimeRef.current = Date.now();
+                }
+              } else if (msg.b !== undefined && msg.a !== undefined) {
+                const now = Date.now();
+                const curState = stateRef.current;
+                
+                // Throttle orderbook parsing to prevent UI freezing
+                let throttleWindow = 5000; // Default: 5 seconds in SCANNING / COOLDOWN
+                if (curState === "APPROACHING" || curState === "ARMED" || curState === "EXECUTING" || curState === "POSITION_OPEN") {
+                  throttleWindow = 500; // 500ms in active trading zones or open positions
+                }
+                
+                if (now - lastDepthProcessedTimeRef.current >= throttleWindow) {
+                  lastDepthProcessedTimeRef.current = now;
+                  const bids = msg.b.map((pair: any) => [parseFloat(pair[0]), parseFloat(pair[1])]) as [number, number][];
+                  const asks = msg.a.map((pair: any) => [parseFloat(pair[0]), parseFloat(pair[1])]) as [number, number][];
+                  depthRef.current = { bids, asks };
+                }
               }
             }
           } catch (err) {
@@ -1316,8 +1381,21 @@ export function useEngine() {
       const cvdCumulative = cvdCumulativeRef.current;
 
       const totalVolTick = buyVol + sellVol;
-      const orderbookImbalance =
-        totalVolTick > 0 ? (buyVol - sellVol) / totalVolTick : 0.0;
+
+      // Calculate actual real-time limit orderbook imbalance from depth if available
+      const depthBids = depthRef.current.bids;
+      const depthAsks = depthRef.current.asks;
+      let totalBidQty = 0;
+      let totalAskQty = 0;
+      depthBids.forEach(level => totalBidQty += level[1]);
+      depthAsks.forEach(level => totalAskQty += level[1]);
+      
+      const limitTotalQty = totalBidQty + totalAskQty;
+      const actualBookImbalance = limitTotalQty > 0 ? (totalBidQty - totalAskQty) / limitTotalQty : 0.0;
+      
+      const orderbookImbalance = limitTotalQty > 0 
+        ? actualBookImbalance 
+        : (totalVolTick > 0 ? (buyVol - sellVol) / totalVolTick : 0.0);
 
       // Track relative volume (RVOL) and tick-by-tick volumes for dynamic breakout/absorption adaptation
       const volInThousand = totalVolTick / 1000;
@@ -1389,7 +1467,7 @@ export function useEngine() {
       let crossoverNearestZone: any = null;
 
       const prevPrice = prevPriceRef.current;
-      if (prevPrice > 0 && prevPrice !== newPrice && positionRef.current === null) {
+      if (configRef.current.execution.solutionBEnabled && prevPrice > 0 && prevPrice !== newPrice && positionRef.current === null) {
         // Find if we crossed any active, non-broken, non-predictive HTF or LTF zone
         for (let i = 0; i < currentZones.length; i++) {
           const z = currentZones[i];
@@ -1570,9 +1648,6 @@ export function useEngine() {
             fractionalSecondDigits: 1,
           } as any)
           .substring(0, 11);
-        const totalVolume = buyVol + sellVol;
-        const orderbookImbalance =
-          totalVolume > 0 ? (buyVol - sellVol) / totalVolume : 0.0;
         const next = [
           ...prev,
           {
@@ -1592,23 +1667,200 @@ export function useEngine() {
 
       // Update unrealized PNL on the open position
       if (positionRef.current) {
-        const active = positionRef.current;
+        let active = positionRef.current;
+
+        // Process grid scale-in (Method 1)
+        if (active.gridLevels && active.gridLevels.some(g => !g.filled)) {
+          let sizeUpdated = false;
+          let currentSize = active.size;
+          let currentEntryPrice = active.entryPrice;
+          
+          const updatedLevels = active.gridLevels.map(level => {
+            if (level.filled) return level;
+            
+            const isHit = active.side === "BUY"
+              ? newPrice <= level.price
+              : newPrice >= level.price;
+              
+            if (isHit) {
+              const prevEntryPrice = currentEntryPrice;
+              const prevSize = currentSize;
+              
+              currentEntryPrice = ((prevEntryPrice * prevSize) + (level.price * level.size)) / (prevSize + level.size);
+              currentSize = prevSize + level.size;
+              
+              // Pay entry fee for this limit level
+              const isBreakout = active.strategyType === "BREAKOUT";
+              const levelFeeRate = isBreakout ? 0.0004 : 0.0002;
+              const levelFee = level.price * level.size * levelFeeRate;
+              
+              setFeesPaid((f) => f + levelFee);
+              setTradedVolumeBtc((v) => v + level.size);
+              setTradedVolumeUsd((v) => v + level.size * level.price);
+              setAccountEquity((eq) => eq - levelFee);
+              setRealizedPnL((p) => p - levelFee);
+              
+              sizeUpdated = true;
+              
+              setSignals((s) => [
+                {
+                  id: Math.random().toString(36).substr(2, 9),
+                  timestamp: new Date().toISOString(),
+                  type: "SYSTEM_ALERT",
+                  side: active.side === "BUY" ? "BUY" : "SELL",
+                  price: level.price,
+                  message: `🛒 [Scale-In Grid] Limit order ${level.id} filled at $${level.price.toFixed(1)}. Added ${level.size.toFixed(4)} BTC. New size: ${currentSize.toFixed(4)} BTC. New Avg Entry Price: $${currentEntryPrice.toFixed(1)}.`
+                },
+                ...s
+              ].slice(0, 50));
+              
+              return { ...level, filled: true };
+            }
+            return level;
+          });
+          
+          if (sizeUpdated) {
+            const posTf = active.timeframe || activeTf;
+            const { tpPrice, slPrice } = calculateTargetPrices(
+              active.side,
+              currentEntryPrice,
+              active.strategyType || "BREAKOUT",
+              posTf,
+              configRef.current.execution.feeExitEnabled,
+              configRef.current.execution.tpSlCalculationType,
+              customAtrRef.current,
+              configRef.current.execution.atrSlMultiplier,
+              configRef.current.execution.atrTpMultiplier,
+            );
+            
+            active = {
+              ...active,
+              size: currentSize,
+              entryPrice: currentEntryPrice,
+              gridLevels: updatedLevels,
+              tpPrice,
+              slPrice
+            };
+            
+            positionRef.current = active;
+            setPosition(active);
+          }
+        }
+
         const diff = newPrice - active.entryPrice;
         const pnl =
           active.side === "BUY" ? diff * active.size : -diff * active.size;
         const pnlPct = (pnl / (active.entryPrice * active.size)) * 100 * 10;
 
+        // Calculate Live Orderbook Pressure & Trade Win Probability
+        let winProbability = 50.0;
+        let pInfo = "Orderbook Balanced";
+
+        if (depthBids && depthAsks && depthBids.length > 0 && depthAsks.length > 0) {
+          const isBuy = active.side === "BUY";
+          
+          // 1. Calculate near-price wall ratios (within 1% range)
+          const bidDepthNear = depthBids.filter(l => Math.abs(newPrice - l[0]) / newPrice <= 0.01);
+          const askDepthNear = depthAsks.filter(l => Math.abs(l[0] - newPrice) / newPrice <= 0.01);
+          
+          const bidVolNear = bidDepthNear.reduce((acc, current) => acc + current[1], 0);
+          const askVolNear = askDepthNear.reduce((acc, current) => acc + current[1], 0);
+          const totalVolNear = bidVolNear + askVolNear;
+          
+          // Bid/Ask volume ratio
+          const supportRatio = totalVolNear > 0 
+            ? (isBuy ? bidVolNear / totalVolNear : askVolNear / totalVolNear)
+            : 0.5;
+
+          // 2. Identify largest walls backing vs opposing us
+          const sortedBids = [...bidDepthNear].sort((a, b) => b[1] - a[1]);
+          const sortedAsks = [...askDepthNear].sort((a, b) => b[1] - a[1]);
+          const keyBidWall = sortedBids[0]; // [price, qty]
+          const keyAskWall = sortedAsks[0]; // [price, qty]
+
+          let supportWallFound = false;
+          let opposingWallFound = false;
+          let supportWallDistPct = 1.0;
+          let opposingWallDistPct = 1.0;
+
+          if (isBuy) {
+            if (keyBidWall) {
+              supportWallFound = true;
+              supportWallDistPct = Math.abs(newPrice - keyBidWall[0]) / newPrice;
+            }
+            if (keyAskWall) {
+              opposingWallFound = true;
+              opposingWallDistPct = Math.abs(keyAskWall[0] - newPrice) / newPrice;
+            }
+          } else {
+            if (keyAskWall) {
+              supportWallFound = true;
+              supportWallDistPct = Math.abs(keyAskWall[0] - newPrice) / newPrice;
+            }
+            if (keyBidWall) {
+              opposingWallFound = true;
+              opposingWallDistPct = Math.abs(newPrice - keyBidWall[0]) / newPrice;
+            }
+          }
+
+          // 3. Proximity to TP vs SL
+          let progressToTp = 0.5;
+          if (active.tpPrice && active.slPrice) {
+            const gap = active.tpPrice - active.slPrice;
+            if (gap !== 0) {
+              progressToTp = isBuy 
+                ? (newPrice - active.slPrice) / gap 
+                : (active.slPrice - newPrice) / Math.abs(gap);
+            }
+            progressToTp = Math.max(0.01, Math.min(0.99, progressToTp));
+          }
+
+          // Combine metrics into standard win probability
+          const trendWeight = progressToTp * 40; // 0 to 40
+          const OBWeight = supportRatio * 30; // 0 to 30
+
+          let WallWeight = 10; // neutral
+          if (supportWallFound && opposingWallFound) {
+            if (supportWallDistPct < opposingWallDistPct) {
+              WallWeight = 15;
+            } else if (supportWallDistPct > opposingWallDistPct) {
+              WallWeight = 5;
+            }
+          }
+
+          const posCvd = active.positionCvd || (active as any).zoneAccumulatedCvd || 0.0;
+          const flowWeight = isBuy ? (posCvd > 0 ? 10 : (posCvd < 0 ? -10 : 0)) : (posCvd < 0 ? 10 : (posCvd > 0 ? -10 : 0));
+
+          winProbability = 10 + trendWeight + OBWeight + WallWeight + flowWeight;
+
+          const microJitter = (Math.random() - 0.5) * 3.0;
+          winProbability = Math.max(5.0, Math.min(98.0, winProbability + microJitter));
+
+          const supportWallPrice = isBuy ? keyBidWall?.[0] : keyAskWall?.[0];
+          const opposingWallPrice = isBuy ? keyAskWall?.[0] : keyBidWall?.[0];
+          const supportWallQty = isBuy ? keyBidWall?.[1] : keyAskWall?.[1];
+          const opposingWallQty = isBuy ? keyAskWall?.[1] : keyBidWall?.[1];
+
+          pInfo = `Dense supporting wall standing at $${supportWallPrice?.toFixed(1) || "0.0"} (${supportWallQty?.toFixed(1) || "0.0"} ${baseAsset}). Opposing barrier: $${opposingWallPrice?.toFixed(1) || "0.0"} (${opposingWallQty?.toFixed(1) || "0.0"} ${baseAsset}). Depth bias has ${(supportRatio * 100).toFixed(1)}% supportive pressure.`;
+        }
+
         const updatedPos = {
           ...active,
           unrealizedPnL: pnl,
           unrealizedPnLPct: pnlPct,
+          winProbability,
+          orderbookPressureInfo: pInfo,
         };
         setPosition(updatedPos);
         positionRef.current = updatedPos;
       }
 
       const baseZones = currentZones.filter(
-        (z) => !z.type.startsWith("PRED LIQ") && z.type !== "ACTIVE POS LIQ",
+        (z) =>
+          !z.type.startsWith("PRED LIQ") &&
+          z.type !== "ACTIVE POS LIQ" &&
+          z.type !== "LIMIT WALL (BIDS)" &&
+          z.type !== "LIMIT WALL (ASKS)",
       );
 
       let anyZoneChanged = false;
@@ -1862,9 +2114,143 @@ export function useEngine() {
         }
       }
 
-      setZones(nextZonesList);
+      // Calculate distance to nearest actual technical level to restrict orderbook analysis strictly to zones
+      let minBaseZoneDist = Infinity;
+      updatedBaseZones.forEach((z) => {
+        if (z.isBroken || z.type.startsWith("PRED LIQ") || z.type === "ACTIVE POS LIQ") return;
+        let dist = 0;
+        const pLow = z.priceLow !== undefined ? z.priceLow : z.price;
+        const pHigh = z.priceHigh !== undefined ? z.priceHigh : z.price;
+        if (newPrice > pHigh) {
+          dist = newPrice - pHigh;
+        } else if (newPrice < pLow) {
+          dist = pLow - newPrice;
+        } else {
+          dist = 0;
+        }
+        if (dist < minBaseZoneDist) {
+          minBaseZoneDist = dist;
+        }
+      });
+
+      const isInteractingWithLevel =
+        stateRef.current !== "SCANNING" ||
+        minBaseZoneDist < approachingThreshold;
+
+      // Extract TOP large limit densities (dense walls in orderbook) ONLY if we are interacting with historic levels to prevent empty space levels/visual noise
+      let topBidWalls: { price: number; qty: number }[] = [];
+      let topAskWalls: { price: number; qty: number }[] = [];
+
+      if (isInteractingWithLevel && depthBids.length > 0 && depthAsks.length > 0) {
+        // Calculate average quantity for dynamic thresholding
+        const totalBidQty = depthBids.reduce((sum, lvl) => sum + lvl[1], 0);
+        const avgBidQty = totalBidQty / depthBids.length;
+        
+        const totalAskQty = depthAsks.reduce((sum, lvl) => sum + lvl[1], 0);
+        const avgAskQty = totalAskQty / depthAsks.length;
+
+        // Select levels that are at least 2.2x the average level quantity (dense walls)
+        depthBids.forEach(([price, qty]) => {
+          if (qty > avgBidQty * 2.2 && price < newPrice) {
+            topBidWalls.push({ price, qty });
+          }
+        });
+
+        depthAsks.forEach(([price, qty]) => {
+          if (qty > avgAskQty * 2.2 && price > newPrice) {
+            topAskWalls.push({ price, qty });
+          }
+        });
+
+        // Limit to top 3 walls to prevent visual noise
+        topBidWalls = topBidWalls.sort((a, b) => b.qty - a.qty).slice(0, 3);
+        topAskWalls = topAskWalls.sort((a, b) => b.qty - a.qty).slice(0, 3);
+
+        // Map them as dynamic zones to overlay onto the chart
+        topBidWalls.forEach((wall) => {
+          const distPct = (newPrice - wall.price) / newPrice;
+          const isPushing = distPct <= 0.003; // Within 0.3% below current price
+          const matchesTechLevel = nextZonesList.some(z => 
+            z.type !== "LIMIT WALL (BIDS)" && 
+            z.type !== "LIMIT WALL (ASKS)" && 
+            z.type !== "ACTIVE POS LIQ" &&
+            Math.abs(z.price - wall.price) / z.price <= 0.0015
+          );
+
+          const criteria = [
+            "Крупная лимитная плотность покупателей (ПЛИТА в стакане).",
+            `Объём плотности: ${wall.qty.toFixed(2)} ${baseAsset} ($${(wall.qty * newPrice / 1000).toFixed(1)}k)`,
+            `Превышает средний лимитный уровень в ${(wall.qty / avgBidQty).toFixed(1)} раз.`,
+          ];
+
+          if (isPushing) {
+            criteria.push("🔥 ЛИМИТНЫЙ ПОДЖАТИЕ: Лимитный покупатель активно толкает и удерживает цену снизу.");
+          }
+          if (matchesTechLevel) {
+            criteria.push("🎯 ПОДТВЕРЖДЕНИЕ УРОВНЯ: Плотность расположена непосредственно в зоне поддержки.");
+          }
+
+          nextZonesList.push({
+            price: +wall.price.toFixed(1),
+            type: "LIMIT WALL (BIDS)",
+            color: isPushing ? "#34d399" : "#10b981", // brighter green if pushing
+            levelStrength: matchesTechLevel ? "HTF" : "LTF",
+            timeframe: "Depth",
+            updatedAt: new Date().toLocaleTimeString("ru-RU"),
+            validationCriteria: criteria,
+          });
+        });
+
+        topAskWalls.forEach((wall) => {
+          const distPct = (wall.price - newPrice) / newPrice;
+          const isPushing = distPct <= 0.003; // Within 0.3% above current price
+          const matchesTechLevel = nextZonesList.some(z => 
+            z.type !== "LIMIT WALL (BIDS)" && 
+            z.type !== "LIMIT WALL (ASKS)" && 
+            z.type !== "ACTIVE POS LIQ" &&
+            Math.abs(z.price - wall.price) / z.price <= 0.0015
+          );
+
+          const criteria = [
+            "Крупная лимитная плотность продавцов (ПЛИТА в стакане).",
+            `Объём плотности: ${wall.qty.toFixed(2)} ${baseAsset} ($${(wall.qty * newPrice / 1000).toFixed(1)}k)`,
+            `Превышает средний лимитный уровень в ${(wall.qty / avgAskQty).toFixed(1)} раз.`,
+          ];
+
+          if (isPushing) {
+            criteria.push("🔥 ЛИМИТНОЕ ДАВЛЕНИЕ: Лимитный продавец активно прижимает и удерживает цену сверху.");
+          }
+          if (matchesTechLevel) {
+            criteria.push("🎯 ПОДТВЕРЖДЕНИЕ УРОВНЯ: Плотность расположена непосредственно в зоне сопротивления.");
+          }
+
+          nextZonesList.push({
+            price: +wall.price.toFixed(1),
+            type: "LIMIT WALL (ASKS)",
+            color: isPushing ? "#f87171" : "#ef4444", // brighter red if pushing
+            levelStrength: matchesTechLevel ? "HTF" : "LTF",
+            timeframe: "Depth",
+            updatedAt: new Date().toLocaleTimeString("ru-RU"),
+            validationCriteria: criteria,
+          });
+        });
+      }
+
       zonesRef.current = nextZonesList;
       const resolvedCurrentZones = nextZonesList;
+
+      // Throttle React state update to prevent UI sluggishness/freezing
+      const tickNow = Date.now();
+      const curState = stateRef.current;
+      let zoneThrottleMs = 5000; // 5s slow scan by default
+      if (curState === "APPROACHING" || curState === "ARMED" || curState === "EXECUTING" || curState === "POSITION_OPEN") {
+        zoneThrottleMs = 1000; // 1s active mode
+      }
+
+      if (tickNow - lastZonesSetTimeRef.current >= zoneThrottleMs || !zonesRef.current || zonesRef.current.length === 0) {
+        setZones(nextZonesList);
+        lastZonesSetTimeRef.current = tickNow;
+      }
 
       // Recalculate precise distances to technical zones with finalized tick price
       minD = Infinity;
@@ -1875,6 +2261,7 @@ export function useEngine() {
         if (
           z.type.startsWith("PRED LIQ") ||
           z.type === "ACTIVE POS LIQ" ||
+          z.type.startsWith("LIMIT WALL") ||
           z.isBroken
         )
           return;
@@ -1970,6 +2357,28 @@ export function useEngine() {
             const zHigh = nearestZone.priceHigh ?? nearestZone.price;
             const zLow = nearestZone.priceLow ?? nearestZone.price;
             
+            // Compute average book quantities for dynamic wall thresholding
+            let avgAskQty = 5.0;
+            if (depthAsks && depthAsks.length > 0) {
+              avgAskQty = depthAsks.reduce((sum, lvl) => sum + lvl[1], 0) / depthAsks.length;
+            }
+
+            // Check for blocker walls that might halt a breakout
+            let hasBlockerAskWall = false;
+            let blockerWallPrice = 0;
+            let blockerWallQty = 0;
+            if (depthAsks && depthAsks.length > 0) {
+              const wall = depthAsks.find(([price, qty]) => {
+                const distPct = (price - newPrice) / newPrice;
+                return distPct >= 0.0003 && distPct <= 0.0045 && qty > avgAskQty * 3.8;
+              });
+              if (wall) {
+                hasBlockerAskWall = true;
+                blockerWallPrice = wall[0];
+                blockerWallQty = wall[1];
+              }
+            }
+
             // Option A: aggressive buying confirmation with OI growth & bid imbalance => TRUE BREAKOUT
             const meetsCvdBreakout = cvdDelta > cvdBreakoutThreshold;
             const isAboveOrAtLevel = newPrice > zHigh - atrVal * 0.05;
@@ -1987,13 +2396,34 @@ export function useEngine() {
               orderbookImbalance > 0.12 &&
               oiDelta > 0.005;
 
-            if (meetsTrueBreakout || meetsAbsorptionFailureBreakout) {
+            // Momentum Handoff: override blocker walls if buying speed and volume represent a massive breakout sprint
+            const isMomentumBreakoutHandoff = tapeAcceleration >= 2.8 || cvdDelta >= cvdBreakoutThreshold * 2.2;
+            const allowBreakout = (meetsTrueBreakout || meetsAbsorptionFailureBreakout) && (!hasBlockerAskWall || isMomentumBreakoutHandoff);
+
+            if (allowBreakout) {
               triggerEntrySide = "BUY";
               chosenStratType = "BREAKOUT";
-              if (meetsTrueBreakout) {
+              if (hasBlockerAskWall && isMomentumBreakoutHandoff) {
+                signalMsg = `⚡ [Momentum Handoff] Resistance Breakout triggered! Blocker Ask Wall sitting at $${blockerWallPrice.toFixed(1)} (${blockerWallQty.toFixed(1)} ${baseAsset}) has been overriden by overwhelming crowd pressure. Tape Speed: ${tapeAcceleration.toFixed(1)}x. Buying volume: +${cvdDelta.toFixed(2)}k.`;
+              } else if (meetsTrueBreakout) {
                 signalMsg = `True Breakout confirmed at resistance high boundary $${zHigh.toFixed(1)} (${nearestZone?.type || ""}). Speed Acceleration: ${tapeAcceleration.toFixed(1)}x. Strong buying CVD: +${cvdDelta.toFixed(2)}k (adaptive threshold: +${cvdBreakoutThreshold.toFixed(2)}k). OI: +${oiDelta.toFixed(3)}M. Imbalance: +${(orderbookImbalance * 100).toFixed(1)}% bids.`;
               } else {
                 signalMsg = `Absorption Failure Squeeze triggered at resistance high boundary $${zHigh.toFixed(1)} (${nearestZone?.type || ""}). Limit Ask Wall collapsed under intensive buying. CVD: +${cvdDelta.toFixed(2)}k (threshold: +${cvdAbsorptionThreshold.toFixed(2)}k). OI: +${oiDelta.toFixed(3)}M. Imbalance: +${(orderbookImbalance * 100).toFixed(1)}% bids.`;
+              }
+            } else if ((meetsTrueBreakout || meetsAbsorptionFailureBreakout) && hasBlockerAskWall && !isMomentumBreakoutHandoff) {
+              // We met standard criteria, but are blocked by a heavy plate!
+              if (Math.random() < 0.15) { // Log occasionally to prevent spam
+                setSignals((s) => [
+                  {
+                    id: Math.random().toString(36).substr(2, 9),
+                    timestamp: new Date().toISOString(),
+                    type: "SYSTEM_ALERT",
+                    side: "NONE",
+                    price: newPrice,
+                    message: `🛡️ [Orderbook Blocker] Standard Breakout deferred: Dense opposing Limit Ask Wall sitting at $${blockerWallPrice.toFixed(1)} (${blockerWallQty.toFixed(1)} ${baseAsset}, ${(blockerWallQty/avgAskQty).toFixed(1)}x avg) blocks upward momentum.`
+                  },
+                  ...s,
+                ].slice(0, 50));
               }
             }
             // Option C: False Breakout (Ложный Пробой) - Bull Trap (Counter-trend fade)
@@ -2019,17 +2449,38 @@ export function useEngine() {
               const meetsImbalanceFade = orderbookImbalance < 0.25;
               const isPriceHoldingResistance = newPrice <= zHigh + Math.max(5 * fsmScale, atrVal * 0.08);
 
+              // 1. Visible dense Ask wall acting as the ceiling
+              const hasDenseAskCeiling = depthAsks && depthAsks.some(([price, qty]) => {
+                const distPct = (price - newPrice) / newPrice;
+                return distPct >= 0 && distPct <= 0.0035 && qty > avgAskQty * 1.9;
+              });
+
+              // 2. Thick orderbook depth on the Ask side (skewed orderbook thickness backing sellers)
+              const hasOrderbookCeilingImbalance = orderbookImbalance < -0.05;
+
+              // 3. Iceberg indicator: heavy buying market orders are active but failing to expand the price (meaning passive sellers are absorbing)
+              const isIcebergSellerAbsorption = cvdDelta > cvdAbsorptionThreshold * 1.4 && tapeAcceleration > 1.8 && newPrice <= zHigh + 2 * fsmScale;
+
+              // Combined soft ceiling check: Either a solid wall is visible, the book is thick with sells, or icebergs are reloading
+              const hasPassiveSellerBacking = hasDenseAskCeiling || hasOrderbookCeilingImbalance || isIcebergSellerAbsorption;
+
               if (
                 (isExhaustionFade || isActiveAbsorptionFade) &&
                 meetsImbalanceFade &&
-                isPriceHoldingResistance
+                isPriceHoldingResistance &&
+                hasPassiveSellerBacking
               ) {
                 triggerEntrySide = "SELL";
                 chosenStratType = "ABSORPTION_FADE";
+
+                let sourceDesc = "hidden Iceberg liquidity";
+                if (hasDenseAskCeiling) sourceDesc = "dense Ask plates";
+                else if (hasOrderbookCeilingImbalance) sourceDesc = "skewed orderbook Ask depth";
+
                 signalMsg =
                   `Absorption Fade triggered inside resistance zone $${zLow.toFixed(1)} - $${zHigh.toFixed(1)} (${nearestZone?.type || ""}). ` +
                   (isActiveAbsorptionFade
-                    ? `Active Seller Limit Absorption: Buyers hit ask (CVD: +${cvdDelta.toFixed(2)}k) but price stalled below boundary $${zHigh.toFixed(1)}. Fresh short OI accumulated: +${oiDelta.toFixed(3)}M.`
+                    ? `Active Seller Limit Absorption: Buyers hit ask (CVD: +${cvdDelta.toFixed(2)}k) but price stalled below boundary $${zHigh.toFixed(1)} under ${sourceDesc}. Fresh short OI accumulated: +${oiDelta.toFixed(3)}M.`
                     : `Aggressive Seller Backing: Tape accelerated but CVD buying exhausted to sell-off (CVD Delta: ${cvdDelta.toFixed(2)}k).`) +
                   ` Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids. Price holding resistance boundary.`;
               }
@@ -2037,6 +2488,28 @@ export function useEngine() {
           } else if (isNearSupport && isTapeAccelerated && nearestZone) {
             const zHigh = nearestZone.priceHigh ?? nearestZone.price;
             const zLow = nearestZone.priceLow ?? nearestZone.price;
+
+            // Compute average book quantities for dynamic wall thresholding
+            let avgBidQty = 5.0;
+            if (depthBids && depthBids.length > 0) {
+              avgBidQty = depthBids.reduce((sum, lvl) => sum + lvl[1], 0) / depthBids.length;
+            }
+
+            // Check for blocker walls that might halt a breakout
+            let hasBlockerBidWall = false;
+            let blockerWallPrice = 0;
+            let blockerWallQty = 0;
+            if (depthBids && depthBids.length > 0) {
+              const wall = depthBids.find(([price, qty]) => {
+                const distPct = (newPrice - price) / newPrice;
+                return distPct >= 0.0003 && distPct <= 0.0045 && qty > avgBidQty * 3.8;
+              });
+              if (wall) {
+                hasBlockerBidWall = true;
+                blockerWallPrice = wall[0];
+                blockerWallQty = wall[1];
+              }
+            }
 
             // Option A: aggressive selling confirmation with OI growth & ask imbalance => TRUE BREAKOUT
             const meetsCvdBreakout = cvdDelta < -cvdBreakoutThreshold;
@@ -2055,13 +2528,34 @@ export function useEngine() {
               orderbookImbalance < -0.12 &&
               oiDelta > 0.005;
 
-            if (meetsTrueBreakdown || meetsAbsorptionFailureBreakdown) {
+            // Momentum Handoff: override blocker walls if selling speed and volume represent a massive breakdown sprint
+            const isMomentumBreakdownHandoff = tapeAcceleration >= 2.8 || cvdDelta <= -cvdBreakoutThreshold * 2.2;
+            const allowBreakdown = (meetsTrueBreakdown || meetsAbsorptionFailureBreakdown) && (!hasBlockerBidWall || isMomentumBreakdownHandoff);
+
+            if (allowBreakdown) {
               triggerEntrySide = "SELL";
               chosenStratType = "BREAKOUT";
-              if (meetsTrueBreakdown) {
+              if (hasBlockerBidWall && isMomentumBreakdownHandoff) {
+                signalMsg = `⚡ [Momentum Handoff] Support Breakdown triggered! Blocker Bid Wall standing at $${blockerWallPrice.toFixed(1)} (${blockerWallQty.toFixed(1)} ${baseAsset}) has been overriden by overwhelming crowd pressure. Tape Speed: ${tapeAcceleration.toFixed(1)}x. Selling volume: ${cvdDelta.toFixed(2)}k.`;
+              } else if (meetsTrueBreakdown) {
                 signalMsg = `True Breakdown confirmed at support low boundary $${zLow.toFixed(1)} (${nearestZone?.type || ""}). Speed Acceleration: ${tapeAcceleration.toFixed(1)}x. Strong selling CVD: ${cvdDelta.toFixed(2)}k (adaptive threshold: -${cvdBreakoutThreshold.toFixed(2)}k). OI: +${oiDelta.toFixed(3)}M. Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids.`;
               } else {
                 signalMsg = `Absorption Failure Breakdown triggered at support low boundary $${zLow.toFixed(1)} (${nearestZone?.type || ""}). Limit Bid Wall collapsed under heavy market dumps. CVD: ${cvdDelta.toFixed(2)}k (threshold: -${cvdAbsorptionThreshold.toFixed(2)}k). OI: +${oiDelta.toFixed(3)}M. Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids.`;
+              }
+            } else if ((meetsTrueBreakdown || meetsAbsorptionFailureBreakdown) && hasBlockerBidWall && !isMomentumBreakdownHandoff) {
+              // Blocked by a heavy bid plate!
+              if (Math.random() < 0.15) { // Log occasionally
+                setSignals((s) => [
+                  {
+                    id: Math.random().toString(36).substr(2, 9),
+                    timestamp: new Date().toISOString(),
+                    type: "SYSTEM_ALERT",
+                    side: "NONE",
+                    price: newPrice,
+                    message: `🛡️ [Orderbook Blocker] Standard Breakdown deferred: Dense supporting Limit Bid Wall standing at $${blockerWallPrice.toFixed(1)} (${blockerWallQty.toFixed(1)} ${baseAsset}, ${(blockerWallQty/avgBidQty).toFixed(1)}x avg) blocks downward momentum.`
+                  },
+                  ...s,
+                ].slice(0, 50));
               }
             }
             // Option C: False Breakdown (Ложный Пробой) - Bear Trap (Counter-trend fade)
@@ -2087,17 +2581,38 @@ export function useEngine() {
               const meetsImbalanceFade = orderbookImbalance > -0.25;
               const isPriceHoldingSupport = newPrice >= zLow - Math.max(5 * fsmScale, atrVal * 0.08);
 
+              // 1. Visible dense Bid wall acting as the floor support
+              const hasDenseBidFloor = depthBids && depthBids.some(([price, qty]) => {
+                const distPct = (newPrice - price) / newPrice;
+                return distPct >= 0 && distPct <= 0.0035 && qty > avgBidQty * 1.9;
+              });
+
+              // 2. Thick orderbook depth on the Bid side (skewed orderbook thickness backing buyers)
+              const hasOrderbookFloorImbalance = orderbookImbalance > 0.05;
+
+              // 3. Iceberg indicator: heavy selling market orders are active but failing to sink price (meaning passive buyers are absorbing)
+              const isIcebergBuyerAbsorption = cvdDelta < -cvdAbsorptionThreshold * 1.4 && tapeAcceleration > 1.8 && newPrice >= zLow - 2 * fsmScale;
+
+              // Combined soft floor check: Either a solid floor is visible, the book is thick with buys, or icebergs are reloading
+              const hasPassiveBuyerBacking = hasDenseBidFloor || hasOrderbookFloorImbalance || isIcebergBuyerAbsorption;
+
               if (
                 (isExhaustionFade || isActiveAbsorptionFade) &&
                 meetsImbalanceFade &&
-                isPriceHoldingSupport
+                isPriceHoldingSupport &&
+                hasPassiveBuyerBacking
               ) {
                 triggerEntrySide = "BUY";
                 chosenStratType = "ABSORPTION_FADE";
+
+                let sourceDesc = "hidden Iceberg liquidity";
+                if (hasDenseBidFloor) sourceDesc = "dense Bid plates";
+                else if (hasOrderbookFloorImbalance) sourceDesc = "skewed orderbook Bid depth";
+
                 signalMsg =
                   `Absorption Fade triggered inside support zone $${zLow.toFixed(1)} - $${zHigh.toFixed(1)} (${nearestZone?.type || ""}). ` +
                   (isActiveAbsorptionFade
-                    ? `Active Buyer Limit Absorption: Sellers dumped (CVD: +${cvdDelta.toFixed(2)}k) but support boundary $${zLow.toFixed(1)} held firm. Fresh long OI accumulated: +${oiDelta.toFixed(3)}M.`
+                    ? `Active Buyer Limit Absorption: Sellers dumped (CVD: ${cvdDelta.toFixed(1)}k) but support boundary $${zLow.toFixed(1)} held firm under ${sourceDesc}. Fresh long OI accumulated: +${oiDelta.toFixed(3)}M.`
                     : `Aggressive Buyer Backing: Tape accelerated but CVD selling exhausted to buying (CVD Delta: +${cvdDelta.toFixed(2)}k).`) +
                   ` Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids. Price holding support boundary.`;
               }
@@ -2128,16 +2643,58 @@ export function useEngine() {
               acc.entries.push({ side: triggerEntrySide, strat: chosenStratType });
             }
 
+            // === ADAPTABILITY CALCULATIONS (VOLATILITY, REGIME, & ZONE DECIDER SYNERGY) ===
+            const currentVolPct = (atrRef.current / newPrice) * 100;
+            let volMultiplier = Math.max(0.4, Math.min(2.5, currentVolPct / 0.1));
+
+            // Dynamic Market Regime Classification
+            let marketRegime: "TREND_EXPANSION" | "CONSOLIDATION_RANGE" | "NORMAL_FLUID" = "NORMAL_FLUID";
+            if (volMultiplier > 1.3 && tapeAcceleration > 1.6) {
+              marketRegime = "TREND_EXPANSION";
+            } else if (volMultiplier < 0.75 && tapeAcceleration < 1.1) {
+              marketRegime = "CONSOLIDATION_RANGE";
+            }
+
+            // Synergy with the Zone POC Decider attributes
+            let zoneSynergyInfo = "";
+            let targetMaxTicksMultiplier = 1.0;
+            if (nearestZone && chosenStratType) {
+              const isHTF = nearestZone.levelStrength === "HTF";
+              const matchesAbsorption = chosenStratType === "ABSORPTION_FADE";
+              const matchesBreakout = chosenStratType === "BREAKOUT";
+
+              if (matchesAbsorption && isHTF) {
+                targetMaxTicksMultiplier = 0.7; // Enters 30% faster due to high structural confidence
+                volMultiplier *= 1.45;
+                zoneSynergyInfo = "🛡️ [HTF Support Protection] Confirming limit absorption at HTF POC aggressively.";
+              } else if (matchesBreakout && isHTF) {
+                targetMaxTicksMultiplier = 1.4; // Adds 40% screening ticks to filter fakeouts
+                volMultiplier *= 0.7;
+                zoneSynergyInfo = "⚠️ [HTF Breakout Scrutiny] Extra screening ticks applied to filter out HTF fakeouts.";
+              } else {
+                zoneSynergyInfo = `🔍 [Zone Sync] Harmonizing precise entry filters with ${nearestZone.type} POC level.`;
+              }
+            } else {
+              zoneSynergyInfo = "📡 [Decider Standby] Active market state scan running.";
+            }
+
+            // Compute dynamic target window size (clamped between 6 and 20 ticks)
+            const dynamicMaxTicks = Math.max(6, Math.min(20, Math.round((12 / volMultiplier) * targetMaxTicksMultiplier)));
+
+            // Dynamic Fast-Track thresholds
+            const fastTrackRequiredTicks = Math.max(3, Math.min(8, Math.round(5 / volMultiplier)));
+            const fastTrackRequiredSignals = Math.max(2, Math.min(5, Math.round(3 / volMultiplier)));
+            const fastTrackTapeThreshold = Math.max(1.3, Math.min(3.0, 2.0 / volMultiplier));
+
+            const dynamicSeconds = (dynamicMaxTicks * 0.25).toFixed(1);
+
             // --- OPTIMIZATION: FAST-TRACK ACCELERATION TRADING TRIGGER ---
-            // If we have collected at least 5 ticks (1.25s), and we have a very strong impulse
-            // (e.g., at least 3 identical signals pushed) AND tape speed acceleration is exceptional (>2.2x),
-            // we can trigger the trade immediately preventing negative price slippage.
             let fastTrackTriggered = false;
             let fastTrackSide: "BUY" | "SELL" | null = null;
             let fastTrackStrat: "BREAKOUT" | "ABSORPTION_FADE" | "FALSE_BREAKOUT" | null = null;
             let fastTrackReasons = "";
 
-            if (acc.ticksCount >= 5 && acc.entries.length >= 3) {
+            if (acc.ticksCount >= fastTrackRequiredTicks && acc.entries.length >= fastTrackRequiredSignals) {
               const countMap: Record<string, number> = {};
               acc.entries.forEach(item => {
                 const key = `${item.side}_${item.strat}`;
@@ -2153,20 +2710,20 @@ export function useEngine() {
                 }
               });
 
-              if (maxCount >= 3) {
+              if (maxCount >= fastTrackRequiredSignals) {
                 const [side, strat] = maxKey.split("_") as ["BUY" | "SELL", "BREAKOUT" | "ABSORPTION_FADE" | "FALSE_BREAKOUT"];
                 const currentAvgTapeSpeed = acc.tapeSpeedAcc / acc.ticksCount;
                 const netCvdAccum = acc.cvdDeltaAcc;
 
-                const isVeryFastTape = currentAvgTapeSpeed > 2.0;
-                const isExtremelyPositiveCvd = side === "BUY" && (strat === "BREAKOUT" ? netCvdAccum > 1.5 : netCvdAccum < -0.6);
-                const isExtremelyNegativeCvd = side === "SELL" && (strat === "BREAKOUT" ? netCvdAccum < -1.5 : netCvdAccum > 0.6);
+                const isVeryFastTape = currentAvgTapeSpeed >= fastTrackTapeThreshold;
+                const isExtremelyPositiveCvd = side === "BUY" && (strat === "BREAKOUT" ? netCvdAccum > 1.2 : netCvdAccum < -0.5);
+                const isExtremelyNegativeCvd = side === "SELL" && (strat === "BREAKOUT" ? netCvdAccum < -1.2 : netCvdAccum > 0.5);
 
                 if (isVeryFastTape && (isExtremelyPositiveCvd || isExtremelyNegativeCvd)) {
                   fastTrackTriggered = true;
                   fastTrackSide = side;
                   fastTrackStrat = strat;
-                  fastTrackReasons = `⚡ [Fast-Track Acceleration] High conviction order-flow impulse detected over ${acc.ticksCount} ticks. Avg Tape Accel: ${currentAvgTapeSpeed.toFixed(1)}x, Net CVD: ${netCvdAccum.toFixed(2)}k. Speeding up execution to capture optimal entry.`;
+                  fastTrackReasons = `⚡ [Adaptive Fast-Track] Momentum impulse matched! Avg Tape Accel: ${currentAvgTapeSpeed.toFixed(1)}x (threshold: ${fastTrackTapeThreshold.toFixed(1)}x), Net CVD: ${netCvdAccum.toFixed(2)}k. Speeding up execution to capture optimal entry at tick ${acc.ticksCount}/${dynamicMaxTicks}.`;
                 }
               }
             }
@@ -2176,9 +2733,9 @@ export function useEngine() {
               chosenStratType = fastTrackStrat;
               signalMsg = fastTrackReasons;
               armedAccumulatorRef.current = null; // Clear accumulator on execution
-            } else if (acc.ticksCount < 12) {
+            } else if (acc.ticksCount < dynamicMaxTicks) {
               // Standard behavior is to hold entry and accumulate a robust rolling statistical set
-              const progressMsg = `⏳ [Precise Entry] Analyzing Order Flow: Accumulating tick ${acc.ticksCount}/12 | Volatility index adjusted. Momentary CVD Change: ${cvdDelta >= 0 ? '+' : ''}${cvdDelta.toFixed(2)}k, Imbalance: ${(orderbookImbalance * 100).toFixed(1)}% bids.`;
+              const progressMsg = `⏳ [Precise Entry] Volatility Adjusted: Tick ${acc.ticksCount}/${dynamicMaxTicks} (${(acc.ticksCount * 0.25).toFixed(1)}s/${dynamicSeconds}s) | Regime: ${marketRegime === 'TREND_EXPANSION' ? '🔥 TREND' : marketRegime === 'CONSOLIDATION_RANGE' ? '💤 RANGE' : '🔄 FLUID'} (Vol Pct: ${currentVolPct.toFixed(3)}%, Multiplier: ${volMultiplier.toFixed(2)}x) | ${zoneSynergyInfo}`;
               
               if (acc.ticksCount % 4 === 1) {
                 setSignals((s) => [
@@ -2197,16 +2754,16 @@ export function useEngine() {
               triggerEntrySide = null;
               chosenStratType = null;
             } else {
-              // We have 12 ticks! Let's do the math-based consensus and smoothing
-              const avgTapeAcceleration = acc.tapeSpeedAcc / 12;
+              // We have dynamicMaxTicks ticks! Let's do the math-based consensus and smoothing
+              const avgTapeAcceleration = acc.tapeSpeedAcc / dynamicMaxTicks;
               const netCvdDelta = acc.cvdDeltaAcc;
-              const avgImbalance = acc.obImbalanceAcc / 12;
+              const avgImbalance = acc.obImbalanceAcc / dynamicMaxTicks;
               const netOiDelta = acc.oiDeltaAcc;
 
               const totalSignalsCount = acc.entries.length;
+              const requiredMinSamples = Math.max(2, Math.round(totalSignalsCount * 0.15));
               
-              // We require at least 2 ticks with valid signal triggers over the 12-tick (3.0s) window
-              if (totalSignalsCount >= 2) {
+              if (totalSignalsCount >= requiredMinSamples) {
                 const countMap: Record<string, number> = {};
                 acc.entries.forEach(item => {
                   const key = `${item.side}_${item.strat}`;
@@ -2227,23 +2784,26 @@ export function useEngine() {
                 let mathematicallyConfirmed = false;
                 let reasons = "";
 
+                // Thresholds are also slightly scaled by volMultiplier to be tighter in ranges and wider in trends
+                const baseCvdMultiplier = marketRegime === "TREND_EXPANSION" ? 1.2 : 0.8;
+
                 if (side === "BUY") {
                   if (strat === "BREAKOUT") {
-                    const meetsCvd = netCvdDelta > 1.2;
-                    const meetsImbalance = avgImbalance > 0.05;
-                    const meetsOi = netOiDelta > -0.03;
+                    const meetsCvd = netCvdDelta > (1.0 * baseCvdMultiplier);
+                    const meetsImbalance = avgImbalance > 0.04;
+                    const meetsOi = netOiDelta > -0.04;
                     if (meetsCvd && meetsImbalance && meetsOi) {
                       mathematicallyConfirmed = true;
-                      reasons = `Sustained breakout confirmation (CVD: +${netCvdDelta.toFixed(2)}k over 3s, Avg Imbalance: +${(avgImbalance * 100).toFixed(1)}% bids, OI change: +${netOiDelta.toFixed(3)}M).`;
+                      reasons = `Sustained breakout confirmation (CVD: +${netCvdDelta.toFixed(2)}k over ${dynamicSeconds}s, Avg Imbalance: +${(avgImbalance * 100).toFixed(1)}% bids, OI: +${netOiDelta.toFixed(3)}M).`;
                     }
                   } else if (strat === "FALSE_BREAKOUT") {
-                    const meetsCvd = netCvdDelta < -0.2 || avgImbalance < -0.01;
+                    const meetsCvd = netCvdDelta < -0.15 || avgImbalance < -0.01;
                     if (meetsCvd) {
                       mathematicallyConfirmed = true;
-                      reasons = `Sustained bull-trap rejection detected over 3s window (Net CVD Delta: ${netCvdDelta.toFixed(2)}k).`;
+                      reasons = `Sustained bull-trap rejection detected over ${dynamicSeconds}s window (Net CVD Delta: ${netCvdDelta.toFixed(2)}k).`;
                     }
                   } else if (strat === "ABSORPTION_FADE") {
-                    const meetsCvd = netCvdDelta < -0.6 || (netCvdDelta > 0.6 && netOiDelta > 0.01);
+                    const meetsCvd = netCvdDelta < -0.5 || (netCvdDelta > 0.5 && netOiDelta > 0.01);
                     const meetsImbalance = avgImbalance < 0.25;
                     if (meetsCvd && meetsImbalance) {
                       mathematicallyConfirmed = true;
@@ -2252,21 +2812,21 @@ export function useEngine() {
                   }
                 } else if (side === "SELL") {
                   if (strat === "BREAKOUT") {
-                    const meetsCvd = netCvdDelta < -1.2;
-                    const meetsImbalance = avgImbalance < -0.05;
-                    const meetsOi = netOiDelta > -0.03;
+                    const meetsCvd = netCvdDelta < (-1.0 * baseCvdMultiplier);
+                    const meetsImbalance = avgImbalance < -0.04;
+                    const meetsOi = netOiDelta > -0.04;
                     if (meetsCvd && meetsImbalance && meetsOi) {
                       mathematicallyConfirmed = true;
-                      reasons = `Sustained breakdown confirmation (CVD: ${netCvdDelta.toFixed(2)}k over 3s, Avg Imbalance: ${(avgImbalance * 100).toFixed(1)}% bids, OI change: +${netOiDelta.toFixed(3)}M).`;
+                      reasons = `Sustained breakdown confirmation (CVD: ${netCvdDelta.toFixed(2)}k over ${dynamicSeconds}s, Avg Imbalance: ${(avgImbalance * 100).toFixed(1)}% bids, OI: +${netOiDelta.toFixed(3)}M).`;
                     }
                   } else if (strat === "FALSE_BREAKOUT") {
-                    const meetsCvd = netCvdDelta > 0.2 || avgImbalance > 0.01;
+                    const meetsCvd = netCvdDelta > 0.15 || avgImbalance > 0.01;
                     if (meetsCvd) {
                       mathematicallyConfirmed = true;
-                      reasons = `Sustained bear-trap rejection detected over 3s window (Net CVD Delta: +${netCvdDelta.toFixed(2)}k).`;
+                      reasons = `Sustained bear-trap rejection detected over ${dynamicSeconds}s window (Net CVD Delta: +${netCvdDelta.toFixed(2)}k).`;
                     }
                   } else if (strat === "ABSORPTION_FADE") {
-                    const meetsCvd = netCvdDelta > 0.6 || (netCvdDelta < -0.6 && netOiDelta > 0.01);
+                    const meetsCvd = netCvdDelta > 0.5 || (netCvdDelta < -0.5 && netOiDelta > 0.01);
                     const meetsImbalance = avgImbalance > -0.25;
                     if (meetsCvd && meetsImbalance) {
                       mathematicallyConfirmed = true;
@@ -2278,7 +2838,7 @@ export function useEngine() {
                 if (mathematicallyConfirmed) {
                   triggerEntrySide = side;
                   chosenStratType = strat;
-                  signalMsg = `🎯 [Precise Entry Mode] ${strat} [${side}] confirmed. Data accumulated over 12 ticks (3.0s). ${reasons} Avg Speed: ${avgTapeAcceleration.toFixed(1)}x.`;
+                  signalMsg = `🎯 [Precise Entry] ${strat} [${side}] confirmed. Data smoothed and filtered over ${dynamicMaxTicks} ticks (${dynamicSeconds}s) in ${marketRegime === 'TREND_EXPANSION' ? 'Impulsive Trend' : marketRegime === 'CONSOLIDATION_RANGE' ? 'Sideways Consolidation' : 'Fluid Regime'}. ${reasons} Avg Speed: ${avgTapeAcceleration.toFixed(1)}x.`;
                 } else {
                   setSignals((s) => [
                     {
@@ -2287,7 +2847,7 @@ export function useEngine() {
                       type: "SYSTEM_ALERT",
                       side: "NONE",
                       price: newPrice,
-                      message: `❌ [Precise Entry] Entry blocked: Flow criteria did not persist/smooth cleanly over 3s accumulation. Net CVD Delta was ${netCvdDelta >= 0 ? '+' : ''}${netCvdDelta.toFixed(2)}k, Avg Imbalance: ${(avgImbalance * 100).toFixed(1)}%.`,
+                      message: `❌ [Precise Entry] Entry blocked: Order flow smoothing criteria was not satisfied over ${dynamicSeconds}s of analysis in ${marketRegime === 'TREND_EXPANSION' ? 'Trend' : 'Range'} mode. Net CVD Delta: ${netCvdDelta >= 0 ? '+' : ''}${netCvdDelta.toFixed(2)}k, Avg Imbalance: ${(avgImbalance * 100).toFixed(1)}%.`,
                     },
                     ...s,
                   ].slice(0, 50));
@@ -2303,7 +2863,7 @@ export function useEngine() {
                     type: "SYSTEM_ALERT",
                     side: "NONE",
                     price: newPrice,
-                    message: `❌ [Precise Entry] Entry blocked: Order flow signals were too sporadic (${totalSignalsCount}/12 ticks had signals) to satisfy deep risk filtering.`,
+                    message: `❌ [Precise Entry] Entry blocked: Order flow signals were too sparse or sporadic (${totalSignalsCount}/${dynamicMaxTicks} ticks had signals) to satisfy deep noise filtration.`,
                   },
                   ...s,
                 ].slice(0, 50));
@@ -2399,12 +2959,14 @@ export function useEngine() {
               const positionSize = shouldReduce ? baseCalculatedSize * 0.5 : baseCalculatedSize;
 
               const isBreakout = chosenStratType === "BREAKOUT";
+              const isGridEnabled = configRef.current.execution.scaleInGridEnabled === true;
+              const actualInitialSize = isGridEnabled ? positionSize * 0.25 : positionSize;
               const entryFeeRate = isBreakout ? 0.0004 : 0.0002;
-              const entryFee = newPrice * positionSize * entryFeeRate;
+              const entryFee = newPrice * actualInitialSize * entryFeeRate;
 
               setFeesPaid((f) => f + entryFee);
-              setTradedVolumeBtc((v) => v + positionSize);
-              setTradedVolumeUsd((v) => v + positionSize * newPrice);
+              setTradedVolumeBtc((v) => v + actualInitialSize);
+              setTradedVolumeUsd((v) => v + actualInitialSize * newPrice);
               setAccountEquity((eq) => eq - entryFee);
               setRealizedPnL((p) => p - entryFee);
 
@@ -2415,12 +2977,27 @@ export function useEngine() {
                 chosenStratType,
                 posTf,
                 configRef.current.execution.feeExitEnabled,
+                configRef.current.execution.tpSlCalculationType,
+                customAtrRef.current,
+                configRef.current.execution.atrSlMultiplier,
+                configRef.current.execution.atrTpMultiplier,
               );
+
+              // Setup 3 limit grid levels if grid is enabled (Method 1)
+              let gridLevels: { price: number; size: number; filled: boolean; id: string }[] | undefined = undefined;
+              if (isGridEnabled && triggerEntrySide) {
+                const step = 0.001; // Spacing of 0.1%, 0.2%, 0.3%
+                gridLevels = [
+                  { id: "1", price: triggerEntrySide === "BUY" ? newPrice * (1 - step) : newPrice * (1 + step), size: positionSize * 0.25, filled: false },
+                  { id: "2", price: triggerEntrySide === "BUY" ? newPrice * (1 - 2 * step) : newPrice * (1 + 2 * step), size: positionSize * 0.25, filled: false },
+                  { id: "3", price: triggerEntrySide === "BUY" ? newPrice * (1 - 3 * step) : newPrice * (1 + 3 * step), size: positionSize * 0.25, filled: false },
+                ];
+              }
 
               const newPos: TradePosition = {
                 side: triggerEntrySide,
                 entryPrice: newPrice,
-                size: positionSize,
+                size: actualInitialSize,
                 unrealizedPnL: 0,
                 unrealizedPnLPct: 0,
                 timestamp: new Date().toLocaleTimeString("ru-RU"),
@@ -2443,6 +3020,7 @@ export function useEngine() {
                 zonePocHit: false,
                 zoneKey: nearestZone ? `${nearestZone.type}_${nearestZone.price}` : undefined,
                 positionTicksCount: 0,
+                gridLevels,
               };
               setPosition(newPos);
 
@@ -2451,10 +3029,10 @@ export function useEngine() {
                 {
                   id: tradeId,
                   timestamp: new Date().toLocaleTimeString("ru-RU"),
-                  type: `${chosenStratType} ENTRY`,
+                  type: isGridEnabled ? `${chosenStratType} GRID_ENTRY (25%)` : `${chosenStratType} ENTRY`,
                   side: triggerEntrySide!,
                   price: newPrice,
-                  size: positionSize,
+                  size: actualInitialSize,
                   strategyType: chosenStratType!,
                 },
                 ...t,
@@ -2546,6 +3124,7 @@ export function useEngine() {
           let updatedTpPrice = active.tpPrice;
           let updatedSize = active.size;
           let updatedHasPartialTP = active.hasPartialTP;
+          let updatedLastPartialPrice = active.lastPartialPrice;
 
           if (configRef.current.execution.feeExitEnabled) {
             const entryFeeRate =
@@ -2633,7 +3212,6 @@ export function useEngine() {
           // 3. Partial Take Profit (50% position scaling)
           if (
             configRef.current.execution.partialTakeProfitEnabled &&
-            !updatedHasPartialTP &&
             !configRef.current.execution.feeExitEnabled
           ) {
             const nearestZoneForPartial =
@@ -2649,14 +3227,33 @@ export function useEngine() {
                     nearestZoneForPartial.type.includes("LOW")) &&
                   minD < 15));
 
-            // If profit reaches 50% of the main TP target OR we hit an opposing level with positive profit, secure 50% size
-            if (
-              pathPnL >= tpTarget * 0.5 ||
-              (isAtOpposingLevel && pathPnL > 0)
-            ) {
+            // Determine if we can do a partial close based on single or recursive mode
+            let canDoPartialClose = false;
+            let triggerReason = "";
+
+            // Check conditions for first or subsequent partial closes
+            const profitCondition = pathPnL >= tpTarget * 0.5 || (isAtOpposingLevel && pathPnL > 0);
+
+            if (profitCondition) {
+              if (!updatedHasPartialTP) {
+                canDoPartialClose = true;
+                triggerReason = "initial";
+              } else if (configRef.current.execution.recursivePartialTpEnabled && active.size >= 0.001) {
+                // For recursive / repeat partial TP, check if price has moved away from previous partial close price
+                const previousPartialPrice = active.lastPartialPrice ?? active.entryPrice;
+                const distFromLastPartial = Math.abs(newPrice - previousPartialPrice);
+                if (distFromLastPartial >= approachingThreshold) {
+                  canDoPartialClose = true;
+                  triggerReason = "recursive";
+                }
+              }
+            }
+
+            if (canDoPartialClose) {
               const partSize = active.size * 0.5;
               updatedSize = active.size - partSize;
               updatedHasPartialTP = true;
+              updatedLastPartialPrice = newPrice;
 
               const partPnL = pathPnL * partSize;
               const partExitFee = newPrice * partSize * 0.0002;
@@ -2684,9 +3281,17 @@ export function useEngine() {
 
               const isTriggeredByOpposingLevel =
                 isAtOpposingLevel && pathPnL > 0 && pathPnL < tpTarget * 0.5;
-              const msgText = isTriggeredByOpposingLevel
-                ? `💰 Secured 50% profit at opposing level (${nearestZoneForPartial?.type || "LEVEL"}) at $${newPrice.toFixed(1)}`
-                : `💰 Secured 50% profit (Partial TP) at $${newPrice.toFixed(1)}`;
+              
+              let msgText = "";
+              if (triggerReason === "recursive") {
+                msgText = isTriggeredByOpposingLevel
+                  ? `🔄 [Repeat Fix 50%] Secured another 50% of remaining position size at opposing level (${nearestZoneForPartial?.type || "LEVEL"}) at $${newPrice.toFixed(1)}`
+                  : `🔄 [Repeat Fix 50%] Secured another 50% of remaining position size (Recursive TP) at $${newPrice.toFixed(1)}`;
+              } else {
+                msgText = isTriggeredByOpposingLevel
+                  ? `💰 Secured 50% profit at opposing level (${nearestZoneForPartial?.type || "LEVEL"}) at $${newPrice.toFixed(1)}`
+                  : `💰 Secured 50% profit (Partial TP) at $${newPrice.toFixed(1)}`;
+              }
 
               setSignals((s) =>
                 [
@@ -2803,37 +3408,116 @@ export function useEngine() {
                         : (updatedZoneTouchType.includes("RES") || updatedZoneTouchType.includes("SUPPLY") || updatedZoneTouchType.includes("HIGH"));
 
                       const flowPower = updatedZoneAccumulatedCvd;
-                      
+
+                      // Compute average book quantities for dynamic wall thresholding
+                      let avgAskQtyComp = 5.0;
+                      let avgBidQtyComp = 5.0;
+                      if (depthAsks && depthAsks.length > 0) {
+                        avgAskQtyComp = depthAsks.reduce((sum, lvl) => sum + lvl[1], 0) / depthAsks.length;
+                      }
+                      if (depthBids && depthBids.length > 0) {
+                        avgBidQtyComp = depthBids.reduce((sum, lvl) => sum + lvl[1], 0) / depthBids.length;
+                      }
+
+                      // Check for blockers within 0.3% of the current price
+                      const nearestAskPlate = depthAsks && depthAsks.find(([pr, qty]) => {
+                        const distPct = (pr - newPrice) / newPrice;
+                        return distPct >= 0 && distPct <= 0.003 && qty > avgAskQtyComp * 2.8;
+                      });
+
+                      const nearestBidPlate = depthBids && depthBids.find(([pr, qty]) => {
+                        const distPct = (newPrice - pr) / newPrice;
+                        return distPct >= 0 && distPct <= 0.003 && qty > avgBidQtyComp * 2.8;
+                      });
+
+                      const hasOpposingLimitPlate = isBuySide ? !!nearestAskPlate : !!nearestBidPlate;
+                      const opposingPlatePrice = isBuySide ? nearestAskPlate?.[0] : nearestBidPlate?.[0];
+                      const opposingPlateQty = isBuySide ? nearestAskPlate?.[1] : nearestBidPlate?.[1];
+                      const opposingPlateRatio = opposingPlateQty ? opposingPlateQty / (isBuySide ? avgAskQtyComp : avgBidQtyComp) : 1;
+
+                      const hasSupportingLimitPlate = isBuySide ? !!nearestBidPlate : !!nearestAskPlate;
+                      const supportingPlatePrice = isBuySide ? nearestBidPlate?.[0] : nearestAskPlate?.[0];
+                      const supportingPlateQty = isBuySide ? nearestBidPlate?.[1] : nearestAskPlate?.[1];
+
                       if (isOpposingZone) {
                         const flowOpposesBreakout = isBuySide ? (flowPower < -1.0) : (flowPower > 1.0);
                         const flowSupportsBreakout = isBuySide ? (flowPower > 1.5) : (flowPower < -1.5);
                         
                         if (flowOpposesBreakout) {
-                          const protectionReason = isBuySide 
-                            ? `⚠️ [Active POC Decision] Heavy bearish pressure at opposing Resistance POC (Flow CVD: ${flowPower.toFixed(2)}k). Position unchanged; relying on standard stop-loss.`
-                            : `⚠️ [Active POC Decision] Heavy bullish pressure at opposing Support POC (Flow CVD: +${flowPower.toFixed(2)}k). Position unchanged; relying on standard stop-loss.`;
-                          
-                          setSignals((s) =>
-                            [
-                              {
-                                id: Math.random().toString(36).substr(2, 9),
-                                timestamp: new Date().toISOString(),
-                                type: "SYSTEM_ALERT",
-                                side: active.side,
-                                price: newPrice,
-                                message: protectionReason,
-                              },
-                              ...s,
-                            ].slice(0, 50)
-                          );
+                          if (hasOpposingLimitPlate) {
+                            if (pathPnL > 0) {
+                              deciderExitTriggered = true;
+                              const secureReason = `🛡️ [Decider Pre-emptive Exit] Opposing heavy limit plate at $${opposingPlatePrice?.toFixed(1)} (${opposingPlateRatio.toFixed(1)}x avg) and weak flow (${flowPower.toFixed(2)}k) blocks upwards move. Closed position to secure profit!`;
+                              
+                              setSignals((s) => [
+                                {
+                                  id: Math.random().toString(36).substr(2, 9),
+                                  timestamp: new Date().toISOString(),
+                                  type: "SYSTEM_ALERT",
+                                  side: isBuySide ? "SELL" : "BUY",
+                                  price: newPrice,
+                                  message: secureReason,
+                                },
+                                ...s,
+                              ].slice(0, 50));
+                            } else {
+                              // Tighten Stop-Loss
+                              const defensiveSl = isBuySide ? newPrice - (atrVal * 0.15) : newPrice + (atrVal * 0.15);
+                              updatedSlPrice = isBuySide ? Math.max(updatedSlPrice || 0, defensiveSl) : Math.min(updatedSlPrice || Infinity, defensiveSl);
+
+                              const protectReason = `🛡️ [Decider Tight Defense] Opposing wall at $${opposingPlatePrice?.toFixed(1)} with weak CVD flow (${flowPower.toFixed(2)}k). Defensive SL tightened to $${updatedSlPrice.toFixed(1)}.`;
+                              
+                              setSignals((s) => [
+                                {
+                                  id: Math.random().toString(36).substr(2, 9),
+                                  timestamp: new Date().toISOString(),
+                                  type: "SYSTEM_ALERT",
+                                  side: active.side,
+                                  price: newPrice,
+                                  message: protectReason,
+                                },
+                                ...s,
+                              ].slice(0, 50));
+                            }
+                          } else {
+                            const protectionReason = isBuySide 
+                              ? `⚠️ [Active POC Decision] Heavy bearish pressure at opposing Resistance POC (Flow CVD: ${flowPower.toFixed(2)}k). Position unchanged; relying on standard stop-loss.`
+                              : `⚠️ [Active POC Decision] Heavy bullish pressure at opposing Support POC (Flow CVD: +${flowPower.toFixed(2)}k). Position unchanged; relying on standard stop-loss.`;
+                            
+                            setSignals((s) =>
+                              [
+                                {
+                                  id: Math.random().toString(36).substr(2, 9),
+                                  timestamp: new Date().toISOString(),
+                                  type: "SYSTEM_ALERT",
+                                  side: active.side,
+                                  price: newPrice,
+                                  message: protectionReason,
+                                },
+                                ...s,
+                              ].slice(0, 50)
+                            );
+                          }
                         } else if (flowSupportsBreakout) {
-                          const successReason = isBuySide
-                            ? `🔥 [Active POC Decision] Breakout confirmed! Strong buying CVD (${flowPower.toFixed(2)}k) breaching opposing Resistance. Target TP extended +30%!`
-                            : `🔥 [Active POC Decision] Breakdown confirmed! Strong selling CVD (${flowPower.toFixed(2)}k) breaching opposing Support. Target TP extended +30%!`;
-                          
-                          if (updatedTpPrice) {
-                            const targetDiff = Math.abs(updatedTpPrice - active.entryPrice);
-                            updatedTpPrice = isBuySide ? updatedTpPrice + targetDiff * 0.3 : updatedTpPrice - targetDiff * 0.3;
+                          let successReason = "";
+                          if (hasOpposingLimitPlate) {
+                            successReason = isBuySide
+                              ? `🔥 [Active POC Decision] Strong Breakout flow (+${flowPower.toFixed(2)}k CVD). Actively eating heavy Limit Ask Wall at $${opposingPlatePrice?.toFixed(1)} (${opposingPlateRatio.toFixed(1)}x avg). Extending TP target +15%.`
+                              : `🔥 [Active POC Decision] Strong Breakdown flow (${flowPower.toFixed(2)}k CVD). Actively eating heavy Limit Bid Wall at $${opposingPlatePrice?.toFixed(1)} (${opposingPlateRatio.toFixed(1)}x avg). Extending TP target +15%.`;
+                            
+                            if (updatedTpPrice) {
+                              const targetDiff = Math.abs(updatedTpPrice - active.entryPrice);
+                              updatedTpPrice = isBuySide ? updatedTpPrice + targetDiff * 0.15 : updatedTpPrice - targetDiff * 0.15;
+                            }
+                          } else {
+                            successReason = isBuySide
+                              ? `🔥 [Active POC Decision] Breakout confirmed! Strong buying CVD (${flowPower.toFixed(2)}k) breaching opposing Resistance. Target TP extended +30%!`
+                              : `🔥 [Active POC Decision] Breakdown confirmed! Strong selling CVD (${flowPower.toFixed(2)}k) breaching opposing Support. Target TP extended +30%!`;
+                            
+                            if (updatedTpPrice) {
+                              const targetDiff = Math.abs(updatedTpPrice - active.entryPrice);
+                              updatedTpPrice = isBuySide ? updatedTpPrice + targetDiff * 0.3 : updatedTpPrice - targetDiff * 0.3;
+                            }
                           }
 
                           setSignals((s) =>
@@ -2870,23 +3554,44 @@ export function useEngine() {
                         const flowFailsHold = isBuySide ? (flowPower < -1.5) : (flowPower > 1.5);
 
                         if (flowFailsHold) {
-                          const emergencyExitReason = isBuySide
-                            ? `🚨 [Active POC Decision] Support level POC collapsed under severe selling CVD (${flowPower.toFixed(2)}k). Relying on standard Stop Loss; pre-emptive exits are disabled.`
-                            : `🚨 [Active POC Decision] Resistance level POC breached under severe buying CVD (+${flowPower.toFixed(2)}k). Relying on standard Stop Loss; pre-emptive exits are disabled.`;
-                          
-                          setSignals((s) =>
-                            [
+                          if (hasSupportingLimitPlate) {
+                            const defensiveSl = isBuySide ? supportingPlatePrice! - 10 : supportingPlatePrice! + 10;
+                            updatedSlPrice = isBuySide ? Math.max(updatedSlPrice || 0, defensiveSl) : Math.min(updatedSlPrice || Infinity, defensiveSl);
+
+                            const blockHoldMsg = isBuySide
+                              ? `🚨 [Active POC Decision] Support level POC under pressure (${flowPower.toFixed(2)}k), but backed by massive Limit Bid Floor at $${supportingPlatePrice?.toFixed(1)}. Defensive SL adapted: $${updatedSlPrice.toFixed(1)}.`
+                              : `🚨 [Active POC Decision] Resistance level POC under pressure (+${flowPower.toFixed(2)}k), but backed by massive Limit Ask Ceiling at $${supportingPlatePrice?.toFixed(1)}. Defensive SL adapted: $${updatedSlPrice.toFixed(1)}.`;
+
+                            setSignals((s) => [
                               {
                                 id: Math.random().toString(36).substr(2, 9),
                                 timestamp: new Date().toISOString(),
                                 type: "SYSTEM_ALERT",
                                 side: active.side,
                                 price: newPrice,
-                                message: emergencyExitReason,
+                                message: blockHoldMsg,
                               },
                               ...s,
-                            ].slice(0, 50)
-                          );
+                            ].slice(0, 50));
+                          } else {
+                            const emergencyExitReason = isBuySide
+                              ? `🚨 [Active POC Decision] Support level POC collapsed under severe selling CVD (${flowPower.toFixed(2)}k). Relying on standard Stop Loss.`
+                              : `🚨 [Active POC Decision] Resistance level POC breached under severe buying CVD (+${flowPower.toFixed(2)}k). Relying on standard Stop Loss.`;
+                            
+                            setSignals((s) =>
+                              [
+                                {
+                                  id: Math.random().toString(36).substr(2, 9),
+                                  timestamp: new Date().toISOString(),
+                                  type: "SYSTEM_ALERT",
+                                  side: active.side,
+                                  price: newPrice,
+                                  message: emergencyExitReason,
+                                },
+                                ...s,
+                              ].slice(0, 50)
+                            );
+                          }
                         } else if (flowSupportsHold) {
                           const reboundReason = isBuySide
                             ? `📈 [Active POC Decision] Strong passive absorption holding Support POC (Acc. CVD: +${flowPower.toFixed(2)}k). Position stabilized.`
@@ -2946,6 +3651,38 @@ export function useEngine() {
           }
 
           if (deciderExitTriggered) {
+            const entryFeeRate = active.strategyType === "BREAKOUT" ? 0.0004 : 0.0002;
+            const entryFee = active.entryPrice * active.size * entryFeeRate;
+            const exitFee = newPrice * active.size * 0.0004; // Taker fee
+
+            setFeesPaid((f) => f + exitFee);
+            setTradedVolumeBtc((v) => v + active.size);
+            setTradedVolumeUsd((v) => v + active.size * newPrice);
+            setCompletedTradesCount((c) => c + 1);
+
+            const finalRealizedPnL = pathPnL * active.size;
+            setRealizedPnL((p) => p + finalRealizedPnL - exitFee);
+            setAccountEquity((eq) => eq + finalRealizedPnL - exitFee);
+
+            oiRef.current -= Math.min(0.4, active.size * 0.15);
+
+            setTrades((t) => [
+              {
+                id: Math.random().toString(36).substr(2, 9),
+                timestamp: new Date().toLocaleTimeString("ru-RU"),
+                type: `${active.strategyType === "BREAKOUT" ? "BO" : "FADE"} DECIDER EXIT`,
+                side: active.side === "BUY" ? "SELL" : "BUY",
+                price: newPrice,
+                size: active.size,
+                pnl: finalRealizedPnL - entryFee - exitFee,
+                strategyType: active.strategyType,
+              },
+              ...t,
+            ]);
+
+            setPosition(null);
+            cooldownTicksRef.current = 12;
+            setState("COOLDOWN");
             return;
           }
 
@@ -2956,6 +3693,7 @@ export function useEngine() {
             tpPrice: updatedTpPrice,
             size: updatedSize,
             hasPartialTP: updatedHasPartialTP,
+            lastPartialPrice: updatedLastPartialPrice,
             maxFavPrice: currentMaxFavPrice,
             positionCvd: updatedPositionCvd,
             adverseTicksCount: updatedAdverseTicksCount,
@@ -3244,6 +3982,10 @@ export function useEngine() {
       "BREAKOUT",
       manualTf,
       configRef.current.execution.feeExitEnabled,
+      configRef.current.execution.tpSlCalculationType,
+      customAtrRef.current,
+      configRef.current.execution.atrSlMultiplier,
+      configRef.current.execution.atrTpMultiplier,
     );
 
     const newPos: TradePosition = {
